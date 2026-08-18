@@ -338,6 +338,199 @@ back to original Arrow types includes:
 * Reading back columns as dictionary encoded (whether an Arrow column and
   the serialized Parquet version are dictionary encoded are independent).
 
+.. _cpp-parquet-page-pruning:
+
+Page-Level Pruning
+==================
+
+Overview
+--------
+
+Parquet files store data in *row groups*, each of which is further divided into
+*pages* within a column chunk.  Page-level pruning avoids reading pages that
+cannot contain rows matching a query predicate, reducing I/O — especially on
+remote filesystems such as Amazon S3.
+
+Page pruning uses two optional Parquet metadata structures:
+
+* **ColumnIndex** – records per-page min/max statistics.  Used to evaluate a
+  predicate and decide which pages may contain matching rows.
+* **OffsetIndex** – records per-page byte offsets and row counts.  Used to map
+  a row selection back to the byte ranges that must be read.
+
+Both structures are written by default in Parquet C++ (they require Parquet
+format v2 or later).  Files written without them fall back silently to
+row-group-only pruning under the default policy.
+
+.. note::
+
+   Page-level pruning requires files written with ColumnIndex and OffsetIndex
+   (Parquet format v2+).  Files produced by older writers or with page index
+   writing disabled will not benefit from page pruning, but will still be read
+   correctly.
+
+API
+---
+
+PageIndexPolicy
+~~~~~~~~~~~~~~~
+
+The :class:`PageIndexPolicy` enum in ``parquet/properties.h`` controls whether
+page indices are loaded and used during a scan:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Value
+     - Behavior
+   * - ``NEVER``
+     - Page indices are never loaded.  The scan uses row-group statistics only.
+   * - ``AUTO`` *(default)*
+     - Page indices are loaded if present; the scan falls back gracefully
+       if they are absent.
+   * - ``ALWAYS``
+     - Page indices are required.  An error is returned if they are absent.
+
+Set the policy on :class:`ArrowReaderProperties` before opening the file:
+
+.. code-block:: cpp
+
+   #include "parquet/properties.h"
+   #include "parquet/file_reader.h"
+
+   parquet::ArrowReaderProperties props;
+   props.set_page_index_policy(parquet::PageIndexPolicy::AUTO);
+
+   auto file_reader = parquet::ParquetFileReader::Open(source);
+   file_reader->set_arrow_reader_properties(props);
+
+ComputePageSelection
+~~~~~~~~~~~~~~~~~~~~
+
+:func:`ParquetFileReader::ComputePageSelection` evaluates a predicate against
+the ColumnIndex of a specified column and returns a
+:class:`RowSelection` per row group.  The RowSelection encodes which rows
+*might* satisfy the predicate using run-length encoding (RLE): each entry
+is either ``skip=true`` (page cannot match) or ``skip=false`` (page might
+match).
+
+.. code-block:: cpp
+
+   // Evaluate column_0 > 50 across all row groups.
+   auto result = file_reader->ComputePageSelection(
+       /*column_index=*/ 0,
+       /*op=*/           parquet::PredicateOp::GT,
+       /*predicate_value=*/ std::any(int32_t(50)));
+
+   auto& selections = result.ValueOrDie();  // map<int, shared_ptr<RowSelection>>
+
+Supported operators (``parquet::PredicateOp``): ``GT``, ``LT``, ``EQ``,
+``GTE``, ``LTE``, ``IS_NULL``, ``IS_NOT_NULL``.
+
+Each call evaluates a single ``column op value`` predicate.  To push down a
+conjunction of predicates over several columns, call ``ComputePageSelection``
+once per column and combine the results with :func:`RowSelection::Intersect`
+(logical AND).  The Parquet dataset scanner does this automatically for
+``AND``-composed filters; ``OR``/``NOT`` sub-expressions are not pushed down and
+are simply not used for pruning (results remain correct because the exact filter
+is re-applied after reading).
+
+GetRecordReader
+~~~~~~~~~~~~~~~
+
+:func:`ParquetFileReader::GetRecordReader` constructs a
+:class:`internal::RecordReader` for a given row group and column.  When a
+:class:`RowSelection` is supplied, the underlying column stream is wrapped in a
+``SparseInputStream`` so that only the byte ranges required for selected pages
+are fetched:
+
+.. code-block:: cpp
+
+   for (auto& [rg_idx, row_sel] : selections) {
+     auto rr = file_reader->GetRecordReader(rg_idx, col_idx, row_sel).ValueOrDie();
+     // consume rr in batches ...
+   }
+
+Passing ``nullptr`` (or omitting the argument) reads all rows, preserving
+existing behavior.
+
+RowSelection helpers
+~~~~~~~~~~~~~~~~~~~~
+
+A :class:`RowSelection` can also be built manually or combined:
+
+.. code-block:: cpp
+
+   // Build from explicit [start, end) ranges
+   auto sel = parquet::RowSelection::FromConsecutiveRanges(
+       {{0, 50}, {100, 150}}, /*total_rows=*/200).ValueOrDie();
+
+   // Logical AND of two selections (rows selected in both)
+   auto combined = sel.Intersect(other_sel).ValueOrDie();
+
+   // Logical OR of two selections (rows selected in either)
+   auto merged   = sel.Union(other_sel).ValueOrDie();
+
+   // Map selection to page byte ranges (useful for custom I/O)
+   auto ranges = sel.ScanRanges(*offset_index, row_group_row_count);
+
+End-to-end example
+------------------
+
+A complete, compilable example is available at
+``cpp/examples/parquet/parquet_page_pruning.cc``.
+
+It demonstrates:
+
+1. Writing a multi-row-group Parquet file with page index enabled.
+2. Opening the file with ``PageIndexPolicy::AUTO``.
+3. Calling ``ComputePageSelection()`` to evaluate ``column_0 > 50``.
+4. Iterating the resulting :class:`RowSelection` objects to obtain per-row-group
+   selected row counts.
+5. Comparing the pruned row count against the full (unpruned) row count.
+
+To build and run the example::
+
+   # Assuming a standard Arrow CMake build in <build_dir>:
+   cmake --build <build_dir> --target parquet-page-pruning-example
+   <build_dir>/examples/parquet/parquet-page-pruning-example
+
+Performance tips
+----------------
+
+* **Pre-buffering**: combine page pruning with ``ArrowReaderProperties::set_pre_buffer(true)``
+  to coalesce the reduced set of byte ranges into a single I/O operation on
+  high-latency filesystems.
+
+* **Multiple predicates**: call ``ComputePageSelection()`` for each predicate column
+  and combine the resulting :class:`RowSelection` objects with
+  :func:`RowSelection::Intersect` (AND) or :func:`RowSelection::Union` (OR).
+
+* **Large row groups**: page pruning is most effective when row groups are large
+  (many pages per group) and the predicate is selective.
+
+* **Column index coverage**: the pruning effectiveness depends on how many pages
+  have statistics that allow the predicate to be proved unsatisfiable.  Sort
+  order within a row group directly affects this.
+
+Limitations
+-----------
+
+* Page pruning requires ColumnIndex and OffsetIndex metadata (Parquet format v2+).
+  Files written by older implementations or with page index writing disabled will
+  fall back to row-group-only pruning under ``PageIndexPolicy::AUTO``.
+
+* Predicate evaluation is conservative: a page is skipped only when the predicate
+  can provably never be satisfied by any value in the page's [min, max] range.
+  Pages with unknown or null statistics are never skipped.
+
+* ``PageIndexPolicy::ALWAYS`` causes an error to be returned if the page index
+  is absent.  It is primarily useful for testing that files were written with
+  page index enabled; prefer ``AUTO`` in production.
+
+* Encryption of ColumnIndex and OffsetIndex modules is not yet supported
+  (see :ref:`Encryption <cpp-parquet-reading>`).
+
 Supported Parquet features
 ==========================
 
@@ -659,5 +852,7 @@ Miscellaneous
 | CRC checksums            | ✓        | ✓        |         |
 +--------------------------+----------+----------+---------+
 
-* \(1) Access to the Column Index, Offset Index and Bloom Filter structures
-  is provided, but data read APIs do not currently make any use of them.
+* \(1) Column Index and Offset Index are used for page-level I/O pruning when
+  ``PageIndexPolicy::AUTO`` or ``PageIndexPolicy::ALWAYS`` is set (see
+  :ref:`cpp-parquet-page-pruning`).  Bloom Filter access is provided but data
+  read APIs do not currently use it for row filtering.
