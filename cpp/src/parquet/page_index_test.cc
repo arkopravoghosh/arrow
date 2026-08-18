@@ -952,4 +952,858 @@ TEST_F(PageIndexBuilderTest, TwoRowGroups) {
   CheckOffsetIndex(/*row_group=*/1, /*column=*/1, page_locations[1][1], final_position);
 }
 
+// ============================================================================
+// Tests for ColumnIndex::FilterPages() predicate evaluation
+// ============================================================================
+//
+// These tests exercise all ten specified cases (plus an all-types parametrized
+// sweep) for the FilterPages() method introduced on TypedColumnIndexImpl.
+//
+// Helper infrastructure
+// ---------------------
+//
+// BuildColumnIndex(node, page_stats) – creates a ColumnIndex from a schema
+//   node and a vector of EncodedStatistics, using the existing
+//   ColumnIndexBuilder path.
+//
+// BuildOffsetIndex(page_locations) – creates an OffsetIndex from an explicit
+//   vector of PageLocations via OffsetIndexBuilder::Make(); Finish(0) is used
+//   so that the stored offsets equal the supplied values verbatim.
+
+namespace {
+
+/// Build a ColumnIndex from a schema node and per-page EncodedStatistics.
+/// Returns both the ColumnIndex and the ColumnDescriptor that backs it.
+/// The ColumnDescriptor MUST outlive the ColumnIndex (TypedColumnIndexImpl stores a
+/// raw pointer to it).
+std::pair<std::unique_ptr<ColumnIndex>, std::unique_ptr<ColumnDescriptor>>
+BuildColumnIndex(schema::NodePtr node, const std::vector<EncodedStatistics>& page_stats,
+                 int16_t max_definition_level = 1, int16_t max_repetition_level = 0) {
+  auto descr = std::make_unique<ColumnDescriptor>(std::move(node), max_definition_level,
+                                                  max_repetition_level);
+  auto builder = ColumnIndexBuilder::Make(descr.get());
+  for (const auto& stats : page_stats) {
+    builder->AddPage(stats, SizeStatistics());
+  }
+  builder->Finish();
+  return {builder->Build(), std::move(descr)};
+}
+
+/// Build an OffsetIndex from an explicit vector of PageLocations.
+/// Finish(0) is called so offsets are stored as-is.
+std::unique_ptr<OffsetIndex> BuildOffsetIndex(
+    const std::vector<PageLocation>& page_locations) {
+  auto builder = OffsetIndexBuilder::Make();
+  for (const auto& loc : page_locations) {
+    builder->AddPage(loc.offset, loc.compressed_page_size, loc.first_row_index);
+  }
+  builder->Finish(/*final_position=*/0);
+  return builder->Build();
+}
+
+/// Encode a plain (non-FLBA, non-ByteArray) scalar value to a raw byte string
+/// suitable for use in EncodedStatistics.  The column descriptor is needed
+/// for Bool which uses a bit-packed representation.
+template <typename DType>
+std::string EncodePlainValue(typename DType::c_type value,
+                             const ColumnDescriptor* descr = nullptr) {
+  auto encoder =
+      MakeTypedEncoder<DType>(Encoding::PLAIN, /*use_dictionary=*/false, descr);
+  encoder->Put(&value, 1);
+  auto buf = encoder->FlushValues();
+  return std::string(reinterpret_cast<const char*>(buf->data()),
+                     static_cast<size_t>(buf->size()));
+}
+
+/// Specialisation for ByteArray: the plain encoding for statistics is just the
+/// raw bytes of the value (length is implicit).
+template <>
+std::string EncodePlainValue<ByteArrayType>(ByteArray value, const ColumnDescriptor*) {
+  return std::string(reinterpret_cast<const char*>(value.ptr),
+                     static_cast<size_t>(value.len));
+}
+
+/// Specialisation for FLBA: the plain encoding for statistics is just the raw
+/// bytes (type_length bytes, no length prefix).
+template <>
+std::string EncodePlainValue<FLBAType>(FLBA value, const ColumnDescriptor* descr) {
+  int32_t len = descr ? descr->type_length() : FLBA_LENGTH;
+  return std::string(reinterpret_cast<const char*>(value.ptr), static_cast<size_t>(len));
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Fixture: TestColumnIndexFilterPages<TestType>
+//
+// TYPED_TEST_SUITE is instantiated over all 8 ParquetTypes so that case 3
+// (AllTypes) runs for each.  Type-specific cases (Int32Predicate15,
+// FloatPredicateGT) only execute meaningful logic for the matching physical
+// type; all other types in the parametrized run exercise the "AllTypes" path
+// instead.
+// ---------------------------------------------------------------------------
+
+template <typename TestType>
+class TestColumnIndexFilterPages : public test::PrimitiveTypedTest<TestType> {
+ public:
+  using T = typename TestType::c_type;
+
+ protected:
+  // Build a ColumnDescriptor for the test type.  FLBA uses FLBA_LENGTH bytes.
+  std::unique_ptr<ColumnDescriptor> MakeDescriptor() {
+    auto node =
+        schema::PrimitiveNode::Make("col", Repetition::OPTIONAL, TestType::type_num,
+                                    ConvertedType::NONE, FLBA_LENGTH);
+    return std::make_unique<ColumnDescriptor>(std::move(node), /*max_def=*/1,
+                                              /*max_rep=*/0);
+  }
+
+  std::string Encode(T value) {
+    auto descr = MakeDescriptor();
+    return EncodePlainValue<TestType>(value, descr.get());
+  }
+
+  // Build min/max stats for a single page.
+  EncodedStatistics MakeStats(T min_val, T max_val) {
+    EncodedStatistics stats;
+    stats.set_min(Encode(min_val)).set_max(Encode(max_val)).set_null_count(0);
+    return stats;
+  }
+
+  // Build an all-null page marker.
+  EncodedStatistics MakeNullStats() {
+    EncodedStatistics stats;
+    stats.all_null_value = true;
+    stats.set_null_count(100);
+    return stats;
+  }
+};
+
+TYPED_TEST_SUITE(TestColumnIndexFilterPages, test::ParquetTypes);
+
+// ---------------------------------------------------------------------------
+// Case 1 – Int32 pages [1,10][11,20][21,30], value=15 → skip pages 0 & 2,
+//           select page 1.
+//
+// This test only runs substantively for Int32Type; all other types in the
+// parametrized sweep pass trivially.
+// ---------------------------------------------------------------------------
+TYPED_TEST(TestColumnIndexFilterPages, Int32Predicate15) {
+  if constexpr (!std::is_same_v<TypeParam, Int32Type>) {
+    GTEST_SKIP() << "Case 1 is Int32-specific; tested via AllTypes for other types";
+  }
+
+  // Three pages: [1,10], [11,20], [21,30].
+  auto node = schema::Int32("col");
+  std::vector<EncodedStatistics> page_stats(3);
+  auto encode = [](int32_t v) {
+    return std::string(reinterpret_cast<const char*>(&v), sizeof(int32_t));
+  };
+  page_stats[0].set_min(encode(1)).set_max(encode(10)).set_null_count(0);
+  page_stats[1].set_min(encode(11)).set_max(encode(20)).set_null_count(0);
+  page_stats[2].set_min(encode(21)).set_max(encode(30)).set_null_count(0);
+
+  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+  ASSERT_NE(nullptr, col_index);
+
+  // OffsetIndex: 3 pages, first_row_index = 0, 100, 200; total rows = 300.
+  std::vector<PageLocation> page_locs = {
+      {/*offset=*/0, /*size=*/100, /*first_row=*/0},
+      {/*offset=*/100, /*size=*/100, /*first_row=*/100},
+      {/*offset=*/200, /*size=*/100, /*first_row=*/200},
+  };
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  // EQ predicate for value=15 should skip pages 0 ([1,10]) and 2 ([21,30]),
+  // and select page 1 ([11,20]).
+  int32_t pred_value = 15;
+  PARQUET_ASSIGN_OR_THROW(
+      auto selection,
+      col_index->FilterPages(std::any(pred_value), PredicateOp::EQ, *off_index,
+                             /*row_group_row_count=*/300));
+
+  ASSERT_EQ(3, selection.page_count());
+  EXPECT_TRUE(selection.selector(0).skip);   // page 0 [1,10]  – skip
+  EXPECT_FALSE(selection.selector(1).skip);  // page 1 [11,20] – select
+  EXPECT_TRUE(selection.selector(2).skip);   // page 2 [21,30] – skip
+
+  // Verify row counts derived from OffsetIndex.
+  EXPECT_EQ(100, selection.selector(0).row_count);
+  EXPECT_EQ(100, selection.selector(1).row_count);
+  EXPECT_EQ(100, selection.selector(2).row_count);
+}
+
+// ---------------------------------------------------------------------------
+// Case 2 – Float pages value > 7.0.
+//   Page 0: [0.0, 5.0]  → max(5.0) < 7.0  → skip  (GT: skip if max < value)
+//   Page 1: [6.0, 10.0] → max(10.0) >= 7.0 → select
+//
+// Only runs substantively for FloatType.
+// ---------------------------------------------------------------------------
+TYPED_TEST(TestColumnIndexFilterPages, FloatPredicateGT) {
+  if constexpr (!std::is_same_v<TypeParam, FloatType>) {
+    GTEST_SKIP() << "Case 2 is Float-specific; tested via AllTypes for other types";
+  }
+
+  auto encode_f = [](float v) {
+    return std::string(reinterpret_cast<const char*>(&v), sizeof(float));
+  };
+
+  auto node = schema::Float("col");
+  std::vector<EncodedStatistics> page_stats(2);
+  page_stats[0].set_min(encode_f(0.0f)).set_max(encode_f(5.0f)).set_null_count(0);
+  page_stats[1].set_min(encode_f(6.0f)).set_max(encode_f(10.0f)).set_null_count(0);
+
+  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+  ASSERT_NE(nullptr, col_index);
+
+  std::vector<PageLocation> page_locs = {
+      {0, 100, 0},
+      {100, 100, 50},
+  };
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  float pred_value = 7.0f;
+  PARQUET_ASSIGN_OR_THROW(
+      auto selection,
+      col_index->FilterPages(std::any(pred_value), PredicateOp::GT, *off_index,
+                             /*row_group_row_count=*/100));
+
+  ASSERT_EQ(2, selection.page_count());
+  EXPECT_TRUE(selection.selector(0).skip);   // page 0: max=5.0 < 7.0 → skip
+  EXPECT_FALSE(selection.selector(1).skip);  // page 1: max=10.0 >= 7.0 → select
+}
+
+// ---------------------------------------------------------------------------
+// Case 3 – AllTypes: one typed ColumnIndex with three pages; predicate selects
+//           only the middle page.  Runs for all 8 ParquetTypes.
+//
+// For each type we construct:
+//   page 0: [lo, lo]   – EQ mid skips (lo ≠ mid)
+//   page 1: [mid, mid] – EQ mid selects
+//   page 2: [hi, hi]   – EQ mid skips (hi ≠ mid)
+// ---------------------------------------------------------------------------
+
+TYPED_TEST(TestColumnIndexFilterPages, AllTypes) {
+  using T = typename TypeParam::c_type;
+
+  if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    GTEST_SKIP() << "Int96 has no defined sort order; FilterPages is not supported";
+  }
+
+  // We need three distinct "ordered" values for the type.  All numeric types
+  // have an obvious ordering.  For ByteArray we use "a"/"b"/"c".  For FLBA we
+  // use 12-byte strings padded with zeros.
+  auto descr = this->MakeDescriptor();
+
+  // lo < mid < hi values, type-specific.
+  T lo{}, mid{}, hi{};
+
+  if constexpr (std::is_same_v<TypeParam, BooleanType>) {
+    // Bool only has two values; make page 0 = [false,false], page 1 = [true,true],
+    // page 2 = all-null (to avoid needing a third distinct value).
+    auto encode_bool = [&](bool v) {
+      return EncodePlainValue<BooleanType>(v, descr.get());
+    };
+
+    std::vector<EncodedStatistics> page_stats(3);
+    page_stats[0]
+        .set_min(encode_bool(false))
+        .set_max(encode_bool(false))
+        .set_null_count(0);
+    page_stats[1].set_min(encode_bool(true)).set_max(encode_bool(true)).set_null_count(0);
+    page_stats[2].all_null_value = true;
+    page_stats[2].set_null_count(50);
+
+    auto node = schema::Boolean("col");
+    auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+    ASSERT_NE(nullptr, col_index);
+
+    std::vector<PageLocation> page_locs = {{0, 50, 0}, {50, 50, 50}, {100, 50, 100}};
+    auto off_index = BuildOffsetIndex(page_locs);
+    ASSERT_NE(nullptr, off_index);
+
+    // EQ true → only page 1 qualifies; page 2 is all-null → skipped by EQ.
+    bool pred_val = true;
+    PARQUET_ASSIGN_OR_THROW(
+        auto sel, col_index->FilterPages(std::any(pred_val), PredicateOp::EQ, *off_index,
+                                         /*row_group_row_count=*/150));
+    ASSERT_EQ(3, sel.page_count());
+    EXPECT_TRUE(sel.selector(0).skip);   // [false,false] does not contain true
+    EXPECT_FALSE(sel.selector(1).skip);  // [true,true] contains true
+    EXPECT_TRUE(sel.selector(2).skip);   // all-null page → skip for EQ
+    return;
+
+  } else if constexpr (std::is_same_v<TypeParam, Int32Type>) {
+    lo = 1;
+    mid = 5;
+    hi = 10;
+  } else if constexpr (std::is_same_v<TypeParam, Int64Type>) {
+    lo = 100L;
+    mid = 500L;
+    hi = 1000L;
+  } else if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    lo = Int96{{1, 0, 0}};
+    mid = Int96{{5, 0, 0}};
+    hi = Int96{{10, 0, 0}};
+  } else if constexpr (std::is_same_v<TypeParam, FloatType>) {
+    lo = 1.0f;
+    mid = 5.0f;
+    hi = 10.0f;
+  } else if constexpr (std::is_same_v<TypeParam, DoubleType>) {
+    lo = 1.0;
+    mid = 5.0;
+    hi = 10.0;
+  } else if constexpr (std::is_same_v<TypeParam, ByteArrayType>) {
+    // ByteArray comparison is lexicographic on raw bytes.
+    lo = ByteArray{std::string_view{"a"}};
+    mid = ByteArray{std::string_view{"e"}};
+    hi = ByteArray{std::string_view{"z"}};
+  } else if constexpr (std::is_same_v<TypeParam, FLBAType>) {
+    // FLBA: use FLBA_LENGTH=12 byte buffers.  lo < mid < hi lexicographically.
+    static const uint8_t lo_bytes[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    static const uint8_t mid_bytes[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5};
+    static const uint8_t hi_bytes[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10};
+    lo = FLBA{lo_bytes};
+    mid = FLBA{mid_bytes};
+    hi = FLBA{hi_bytes};
+  }
+
+  // Encode values using the column descriptor (needed for Bool, FLBA).
+  auto encode = [&](T v) { return EncodePlainValue<TypeParam>(v, descr.get()); };
+
+  // page 0: [lo, lo]   → does not contain mid
+  // page 1: [mid, mid] → contains mid  (selected by EQ mid)
+  // page 2: [hi, hi]   → does not contain mid
+  std::vector<EncodedStatistics> page_stats(3);
+  page_stats[0].set_min(encode(lo)).set_max(encode(lo)).set_null_count(0);
+  page_stats[1].set_min(encode(mid)).set_max(encode(mid)).set_null_count(0);
+  page_stats[2].set_min(encode(hi)).set_max(encode(hi)).set_null_count(0);
+
+  auto node = schema::PrimitiveNode::Make(
+      "col", Repetition::OPTIONAL, TypeParam::type_num, ConvertedType::NONE, FLBA_LENGTH);
+  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+  ASSERT_NE(nullptr, col_index);
+
+  std::vector<PageLocation> page_locs = {{0, 100, 0}, {100, 100, 100}, {200, 100, 200}};
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel, col_index->FilterPages(std::any(mid), PredicateOp::EQ, *off_index,
+                                       /*row_group_row_count=*/300));
+
+  ASSERT_EQ(3, sel.page_count());
+  EXPECT_TRUE(sel.selector(0).skip);   // page 0 has only lo → skip
+  EXPECT_FALSE(sel.selector(1).skip);  // page 1 has mid → select
+  EXPECT_TRUE(sel.selector(2).skip);   // page 2 has only hi → skip
+}
+
+// ---------------------------------------------------------------------------
+// Case 4 – All-null page always skipped for value predicates.
+// ---------------------------------------------------------------------------
+TYPED_TEST(TestColumnIndexFilterPages, AllNullPage) {
+  using T = typename TypeParam::c_type;
+
+  if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    GTEST_SKIP() << "Int96 has no defined sort order; FilterPages is not supported";
+  }
+
+  auto descr = this->MakeDescriptor();
+
+  // For simplicity construct a T value that the column index builder can
+  // encode.  Use a per-type constant.
+  T some_value{};
+  if constexpr (std::is_same_v<TypeParam, Int32Type>) {
+    some_value = 42;
+  } else if constexpr (std::is_same_v<TypeParam, Int64Type>) {
+    some_value = 42L;
+  } else if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    some_value = Int96{{42, 0, 0}};
+  } else if constexpr (std::is_same_v<TypeParam, FloatType>) {
+    some_value = 42.0f;
+  } else if constexpr (std::is_same_v<TypeParam, DoubleType>) {
+    some_value = 42.0;
+  } else if constexpr (std::is_same_v<TypeParam, BooleanType>) {
+    some_value = true;
+  } else if constexpr (std::is_same_v<TypeParam, ByteArrayType>) {
+    some_value = ByteArray{std::string_view{"x"}};
+  } else if constexpr (std::is_same_v<TypeParam, FLBAType>) {
+    static const uint8_t buf[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    some_value = FLBA{buf};
+  }
+
+  auto encode = [&](T v) { return EncodePlainValue<TypeParam>(v, descr.get()); };
+
+  // Two pages: page 0 is all-null, page 1 has data.
+  std::vector<EncodedStatistics> page_stats(2);
+  page_stats[0].all_null_value = true;
+  page_stats[0].set_null_count(100);
+  page_stats[1].set_min(encode(some_value)).set_max(encode(some_value)).set_null_count(0);
+
+  auto node = schema::PrimitiveNode::Make(
+      "col", Repetition::OPTIONAL, TypeParam::type_num, ConvertedType::NONE, FLBA_LENGTH);
+  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+  ASSERT_NE(nullptr, col_index);
+
+  std::vector<PageLocation> page_locs = {{0, 50, 0}, {50, 50, 100}};
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  // EQ predicate: all-null page must be skipped, non-null page selected
+  // (since min==max==some_value matches EQ some_value).
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel, col_index->FilterPages(std::any(some_value), PredicateOp::EQ, *off_index,
+                                       /*row_group_row_count=*/200));
+
+  ASSERT_EQ(2, sel.page_count());
+  EXPECT_TRUE(sel.selector(0).skip);   // all-null page → must skip
+  EXPECT_FALSE(sel.selector(1).skip);  // non-null page containing some_value → select
+
+  // Also verify IS_NULL on the all-null page: must NOT skip.
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel_null, col_index->FilterPages(std::any{}, PredicateOp::IS_NULL, *off_index,
+                                            /*row_group_row_count=*/200));
+
+  ASSERT_EQ(2, sel_null.page_count());
+  EXPECT_FALSE(sel_null.selector(0).skip);  // all-null page → keep for IS_NULL
+  EXPECT_FALSE(sel_null.selector(1).skip);  // non-null page → conservatively keep
+}
+
+// ---------------------------------------------------------------------------
+// Case 5 – Row counts derived from OffsetIndex first_row_index deltas.
+//   first_row_index = [0, 100, 250]; total rows = 400
+//   Expected row counts: page 0 → 100, page 1 → 150, page 2 → 150
+// ---------------------------------------------------------------------------
+TYPED_TEST(TestColumnIndexFilterPages, RowCountsFromOffsetIndex) {
+  using T = typename TypeParam::c_type;
+
+  auto descr = this->MakeDescriptor();
+
+  T some_value{};
+  if constexpr (std::is_same_v<TypeParam, Int32Type>) {
+    some_value = 1;
+  } else if constexpr (std::is_same_v<TypeParam, Int64Type>) {
+    some_value = 1L;
+  } else if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    some_value = Int96{{1, 0, 0}};
+  } else if constexpr (std::is_same_v<TypeParam, FloatType>) {
+    some_value = 1.0f;
+  } else if constexpr (std::is_same_v<TypeParam, DoubleType>) {
+    some_value = 1.0;
+  } else if constexpr (std::is_same_v<TypeParam, BooleanType>) {
+    some_value = false;
+  } else if constexpr (std::is_same_v<TypeParam, ByteArrayType>) {
+    some_value = ByteArray{std::string_view{"a"}};
+  } else if constexpr (std::is_same_v<TypeParam, FLBAType>) {
+    static const uint8_t buf[FLBA_LENGTH] = {};
+    some_value = FLBA{buf};
+  }
+
+  auto encode = [&](T v) { return EncodePlainValue<TypeParam>(v, descr.get()); };
+  auto encoded_val = encode(some_value);
+
+  // Three pages, all with the same min/max == some_value (IS_NOT_NULL selects all).
+  std::vector<EncodedStatistics> page_stats(3);
+  for (int i = 0; i < 3; ++i) {
+    page_stats[i].set_min(encoded_val).set_max(encoded_val).set_null_count(0);
+  }
+
+  auto node = schema::PrimitiveNode::Make(
+      "col", Repetition::OPTIONAL, TypeParam::type_num, ConvertedType::NONE, FLBA_LENGTH);
+  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+  ASSERT_NE(nullptr, col_index);
+
+  // first_row_index: [0, 100, 250]; total = 400.
+  std::vector<PageLocation> page_locs = {
+      {0, 100, 0},
+      {100, 100, 100},
+      {200, 100, 250},
+  };
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  // IS_NOT_NULL selects all pages; use it to get RowSelection with correct row counts.
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel, col_index->FilterPages(std::any{}, PredicateOp::IS_NOT_NULL, *off_index,
+                                       /*row_group_row_count=*/400));
+
+  ASSERT_EQ(3, sel.page_count());
+  EXPECT_EQ(100, sel.selector(0).row_count);  // 100 - 0 = 100
+  EXPECT_EQ(150, sel.selector(1).row_count);  // 250 - 100 = 150
+  EXPECT_EQ(150, sel.selector(2).row_count);  // 400 - 250 = 150
+  EXPECT_EQ(400, sel.row_count());
+}
+
+// ---------------------------------------------------------------------------
+// Case 6 – Predicate overlaps every page → select all (no page skipped).
+// ---------------------------------------------------------------------------
+TYPED_TEST(TestColumnIndexFilterPages, PredicateOverlapsAll) {
+  using T = typename TypeParam::c_type;
+
+  if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    GTEST_SKIP() << "Int96 has no defined sort order; FilterPages is not supported";
+  }
+
+  auto descr = this->MakeDescriptor();
+
+  // Construct lo <= predicate <= hi per type.
+  T lo{}, pred{}, hi{};
+  if constexpr (std::is_same_v<TypeParam, Int32Type>) {
+    lo = 1;
+    pred = 50;
+    hi = 100;
+  } else if constexpr (std::is_same_v<TypeParam, Int64Type>) {
+    lo = 1L;
+    pred = 50L;
+    hi = 100L;
+  } else if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    lo = Int96{{1, 0, 0}};
+    pred = Int96{{50, 0, 0}};
+    hi = Int96{{100, 0, 0}};
+  } else if constexpr (std::is_same_v<TypeParam, FloatType>) {
+    lo = 1.0f;
+    pred = 50.0f;
+    hi = 100.0f;
+  } else if constexpr (std::is_same_v<TypeParam, DoubleType>) {
+    lo = 1.0;
+    pred = 50.0;
+    hi = 100.0;
+  } else if constexpr (std::is_same_v<TypeParam, BooleanType>) {
+    // For Bool use IS_NOT_NULL which always selects non-null pages.
+    lo = false;
+    pred = false;
+    hi = true;
+  } else if constexpr (std::is_same_v<TypeParam, ByteArrayType>) {
+    lo = ByteArray{std::string_view{"a"}};
+    pred = ByteArray{std::string_view{"m"}};
+    hi = ByteArray{std::string_view{"z"}};
+  } else if constexpr (std::is_same_v<TypeParam, FLBAType>) {
+    static const uint8_t lo_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    static const uint8_t hi_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100};
+    static const uint8_t pred_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50};
+    lo = FLBA{lo_b};
+    hi = FLBA{hi_b};
+    pred = FLBA{pred_b};
+  }
+
+  auto encode = [&](T v) { return EncodePlainValue<TypeParam>(v, descr.get()); };
+
+  // Two pages, both covering [lo, hi].  pred is in [lo, hi] → EQ selects both.
+  std::vector<EncodedStatistics> page_stats(2);
+  page_stats[0].set_min(encode(lo)).set_max(encode(hi)).set_null_count(0);
+  page_stats[1].set_min(encode(lo)).set_max(encode(hi)).set_null_count(0);
+
+  auto node = schema::PrimitiveNode::Make(
+      "col", Repetition::OPTIONAL, TypeParam::type_num, ConvertedType::NONE, FLBA_LENGTH);
+  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+  ASSERT_NE(nullptr, col_index);
+
+  std::vector<PageLocation> page_locs = {{0, 100, 0}, {100, 100, 100}};
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  PredicateOp op =
+      std::is_same_v<TypeParam, BooleanType> ? PredicateOp::IS_NOT_NULL : PredicateOp::EQ;
+
+  PARQUET_ASSIGN_OR_THROW(auto sel, col_index->FilterPages(std::any(pred), op, *off_index,
+                                                           /*row_group_row_count=*/200));
+
+  ASSERT_EQ(2, sel.page_count());
+  EXPECT_FALSE(sel.selector(0).skip);  // pred in [lo,hi] → select
+  EXPECT_FALSE(sel.selector(1).skip);  // pred in [lo,hi] → select
+}
+
+// ---------------------------------------------------------------------------
+// Case 7 – Predicate overlaps no page → skip all.
+// ---------------------------------------------------------------------------
+TYPED_TEST(TestColumnIndexFilterPages, PredicateOverlapsNone) {
+  using T = typename TypeParam::c_type;
+
+  if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    GTEST_SKIP() << "Int96 has no defined sort order; FilterPages is not supported";
+  }
+
+  if constexpr (std::is_same_v<TypeParam, BooleanType>) {
+    // Bool only has two distinct values; EQ on a value not in [false,false]
+    // range. Use true as pred against pages with [false,false].
+    auto encode_bool = [](bool v) { return EncodePlainValue<BooleanType>(v, nullptr); };
+    auto node = schema::Boolean("col");
+    std::vector<EncodedStatistics> page_stats(2);
+    page_stats[0]
+        .set_min(encode_bool(false))
+        .set_max(encode_bool(false))
+        .set_null_count(0);
+    page_stats[1]
+        .set_min(encode_bool(false))
+        .set_max(encode_bool(false))
+        .set_null_count(0);
+
+    auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+    ASSERT_NE(nullptr, col_index);
+
+    std::vector<PageLocation> page_locs = {{0, 100, 0}, {100, 100, 100}};
+    auto off_index = BuildOffsetIndex(page_locs);
+    ASSERT_NE(nullptr, off_index);
+
+    bool pred_val = true;
+    PARQUET_ASSIGN_OR_THROW(
+        auto sel, col_index->FilterPages(std::any(pred_val), PredicateOp::EQ, *off_index,
+                                         /*row_group_row_count=*/200));
+
+    ASSERT_EQ(2, sel.page_count());
+    EXPECT_TRUE(sel.selector(0).skip);
+    EXPECT_TRUE(sel.selector(1).skip);
+    return;
+  }
+
+  auto descr = this->MakeDescriptor();
+
+  // All pages contain values in [lo, hi]; pred is strictly above hi.
+  T lo{}, hi{}, pred_above{};
+  if constexpr (std::is_same_v<TypeParam, Int32Type>) {
+    lo = 1;
+    hi = 10;
+    pred_above = 100;
+  } else if constexpr (std::is_same_v<TypeParam, Int64Type>) {
+    lo = 1L;
+    hi = 10L;
+    pred_above = 100L;
+  } else if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    lo = Int96{{1, 0, 0}};
+    hi = Int96{{10, 0, 0}};
+    pred_above = Int96{{100, 0, 0}};
+  } else if constexpr (std::is_same_v<TypeParam, FloatType>) {
+    lo = 1.0f;
+    hi = 10.0f;
+    pred_above = 100.0f;
+  } else if constexpr (std::is_same_v<TypeParam, DoubleType>) {
+    lo = 1.0;
+    hi = 10.0;
+    pred_above = 100.0;
+  } else if constexpr (std::is_same_v<TypeParam, ByteArrayType>) {
+    lo = ByteArray{std::string_view{"a"}};
+    hi = ByteArray{std::string_view{"b"}};
+    pred_above = ByteArray{std::string_view{"z"}};
+  } else if constexpr (std::is_same_v<TypeParam, FLBAType>) {
+    static const uint8_t lo_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    static const uint8_t hi_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10};
+    static const uint8_t above_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100};
+    lo = FLBA{lo_b};
+    hi = FLBA{hi_b};
+    pred_above = FLBA{above_b};
+  }
+
+  auto encode = [&](T v) { return EncodePlainValue<TypeParam>(v, descr.get()); };
+
+  std::vector<EncodedStatistics> page_stats(2);
+  page_stats[0].set_min(encode(lo)).set_max(encode(hi)).set_null_count(0);
+  page_stats[1].set_min(encode(lo)).set_max(encode(hi)).set_null_count(0);
+
+  auto node = schema::PrimitiveNode::Make(
+      "col", Repetition::OPTIONAL, TypeParam::type_num, ConvertedType::NONE, FLBA_LENGTH);
+  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+  ASSERT_NE(nullptr, col_index);
+
+  std::vector<PageLocation> page_locs = {{0, 100, 0}, {100, 100, 100}};
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  // EQ pred_above: all pages have max <= hi < pred_above → all skipped.
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel, col_index->FilterPages(std::any(pred_above), PredicateOp::EQ, *off_index,
+                                       /*row_group_row_count=*/200));
+
+  ASSERT_EQ(2, sel.page_count());
+  EXPECT_TRUE(sel.selector(0).skip);
+  EXPECT_TRUE(sel.selector(1).skip);
+}
+
+// ---------------------------------------------------------------------------
+// Case 8 – Single page: match and non-match.
+// ---------------------------------------------------------------------------
+TYPED_TEST(TestColumnIndexFilterPages, SinglePageMatch) {
+  using T = typename TypeParam::c_type;
+
+  if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    GTEST_SKIP() << "Int96 has no defined sort order; FilterPages is not supported";
+  }
+
+  auto descr = this->MakeDescriptor();
+
+  T in_range{}, out_of_range{};
+  if constexpr (std::is_same_v<TypeParam, Int32Type>) {
+    in_range = 5;
+    out_of_range = 99;
+  } else if constexpr (std::is_same_v<TypeParam, Int64Type>) {
+    in_range = 5L;
+    out_of_range = 99L;
+  } else if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    in_range = Int96{{5, 0, 0}};
+    out_of_range = Int96{{99, 0, 0}};
+  } else if constexpr (std::is_same_v<TypeParam, FloatType>) {
+    in_range = 5.0f;
+    out_of_range = 99.0f;
+  } else if constexpr (std::is_same_v<TypeParam, DoubleType>) {
+    in_range = 5.0;
+    out_of_range = 99.0;
+  } else if constexpr (std::is_same_v<TypeParam, BooleanType>) {
+    in_range = true;
+    out_of_range = false;  // [true,true] does not contain false
+  } else if constexpr (std::is_same_v<TypeParam, ByteArrayType>) {
+    in_range = ByteArray{std::string_view{"e"}};
+    out_of_range = ByteArray{std::string_view{"z"}};
+  } else if constexpr (std::is_same_v<TypeParam, FLBAType>) {
+    static const uint8_t in_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5};
+    static const uint8_t out_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 99};
+    in_range = FLBA{in_b};
+    out_of_range = FLBA{out_b};
+  }
+
+  auto encode = [&](T v) { return EncodePlainValue<TypeParam>(v, descr.get()); };
+
+  // Single page [in_range, in_range].
+  std::vector<EncodedStatistics> page_stats(1);
+  page_stats[0].set_min(encode(in_range)).set_max(encode(in_range)).set_null_count(0);
+
+  auto node = schema::PrimitiveNode::Make(
+      "col", Repetition::OPTIONAL, TypeParam::type_num, ConvertedType::NONE, FLBA_LENGTH);
+  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+  ASSERT_NE(nullptr, col_index);
+
+  std::vector<PageLocation> page_locs = {{0, 200, 0}};
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  // --- Match: EQ in_range against [in_range,in_range] → select.
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel_match,
+      col_index->FilterPages(std::any(in_range), PredicateOp::EQ, *off_index,
+                             /*row_group_row_count=*/200));
+
+  ASSERT_EQ(1, sel_match.page_count());
+  EXPECT_FALSE(sel_match.selector(0).skip);
+  EXPECT_EQ(200, sel_match.selector(0).row_count);
+
+  // --- Non-match: EQ out_of_range against [in_range,in_range] → skip.
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel_no_match,
+      col_index->FilterPages(std::any(out_of_range), PredicateOp::EQ, *off_index,
+                             /*row_group_row_count=*/200));
+
+  ASSERT_EQ(1, sel_no_match.page_count());
+  EXPECT_TRUE(sel_no_match.selector(0).skip);
+}
+
+// ---------------------------------------------------------------------------
+// Case 9 – min == max per page (degenerate pages).
+// ---------------------------------------------------------------------------
+TYPED_TEST(TestColumnIndexFilterPages, MinEqualsMax) {
+  using T = typename TypeParam::c_type;
+
+  if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    GTEST_SKIP() << "Int96 has no defined sort order; FilterPages is not supported";
+  }
+
+  auto descr = this->MakeDescriptor();
+
+  T val_a{}, val_b{};
+  if constexpr (std::is_same_v<TypeParam, Int32Type>) {
+    val_a = 7;
+    val_b = 42;
+  } else if constexpr (std::is_same_v<TypeParam, Int64Type>) {
+    val_a = 7L;
+    val_b = 42L;
+  } else if constexpr (std::is_same_v<TypeParam, Int96Type>) {
+    val_a = Int96{{7, 0, 0}};
+    val_b = Int96{{42, 0, 0}};
+  } else if constexpr (std::is_same_v<TypeParam, FloatType>) {
+    val_a = 7.0f;
+    val_b = 42.0f;
+  } else if constexpr (std::is_same_v<TypeParam, DoubleType>) {
+    val_a = 7.0;
+    val_b = 42.0;
+  } else if constexpr (std::is_same_v<TypeParam, BooleanType>) {
+    val_a = false;
+    val_b = true;
+  } else if constexpr (std::is_same_v<TypeParam, ByteArrayType>) {
+    val_a = ByteArray{std::string_view{"g"}};
+    val_b = ByteArray{std::string_view{"q"}};
+  } else if constexpr (std::is_same_v<TypeParam, FLBAType>) {
+    static const uint8_t a_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7};
+    static const uint8_t b_b[FLBA_LENGTH] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42};
+    val_a = FLBA{a_b};
+    val_b = FLBA{b_b};
+  }
+
+  auto encode = [&](T v) { return EncodePlainValue<TypeParam>(v, descr.get()); };
+
+  // Two degenerate pages: page 0 = [val_a, val_a], page 1 = [val_b, val_b].
+  std::vector<EncodedStatistics> page_stats(2);
+  page_stats[0].set_min(encode(val_a)).set_max(encode(val_a)).set_null_count(0);
+  page_stats[1].set_min(encode(val_b)).set_max(encode(val_b)).set_null_count(0);
+
+  auto node = schema::PrimitiveNode::Make(
+      "col", Repetition::OPTIONAL, TypeParam::type_num, ConvertedType::NONE, FLBA_LENGTH);
+  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+  ASSERT_NE(nullptr, col_index);
+
+  std::vector<PageLocation> page_locs = {{0, 100, 0}, {100, 100, 100}};
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  // EQ val_a: page 0 has exactly val_a → select; page 1 has val_b ≠ val_a → skip.
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel, col_index->FilterPages(std::any(val_a), PredicateOp::EQ, *off_index,
+                                       /*row_group_row_count=*/200));
+
+  ASSERT_EQ(2, sel.page_count());
+  EXPECT_FALSE(sel.selector(0).skip);  // [val_a, val_a] contains val_a
+  EXPECT_TRUE(sel.selector(1).skip);   // [val_b, val_b] does not contain val_a
+
+  // EQ val_b: page 1 has exactly val_b → select; page 0 has val_a ≠ val_b → skip.
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel2, col_index->FilterPages(std::any(val_b), PredicateOp::EQ, *off_index,
+                                        /*row_group_row_count=*/200));
+
+  ASSERT_EQ(2, sel2.page_count());
+  EXPECT_TRUE(sel2.selector(0).skip);   // [val_a, val_a] does not contain val_b
+  EXPECT_FALSE(sel2.selector(1).skip);  // [val_b, val_b] contains val_b
+}
+
+// ---------------------------------------------------------------------------
+// Case 10 – Zero pages → empty RowSelection.
+// ---------------------------------------------------------------------------
+TYPED_TEST(TestColumnIndexFilterPages, ZeroPages) {
+  using T = typename TypeParam::c_type;
+
+  // Build a column index with zero pages (no stats entries).
+  auto node = schema::PrimitiveNode::Make(
+      "col", Repetition::OPTIONAL, TypeParam::type_num, ConvertedType::NONE, FLBA_LENGTH);
+  auto [col_index, col_descr] = BuildColumnIndex(node, /*page_stats=*/{});
+  // A column index with zero pages may return nullptr from Build()
+  // (no pages means no data to index).  In that case the test cannot proceed
+  // against FilterPages on a nullptr — so we build the offset index and verify
+  // only when a valid column index is returned.
+  if (col_index == nullptr) {
+    // Expected: builder returns nullptr for zero-page indexes.
+    SUCCEED() << "ColumnIndexBuilder::Build() returns nullptr for zero pages";
+    return;
+  }
+
+  std::vector<PageLocation> page_locs = {};
+  auto off_index = BuildOffsetIndex(page_locs);
+  ASSERT_NE(nullptr, off_index);
+
+  T dummy_val{};
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel, col_index->FilterPages(std::any(dummy_val), PredicateOp::EQ, *off_index,
+                                       /*row_group_row_count=*/0));
+
+  EXPECT_EQ(0, sel.page_count());
+  EXPECT_EQ(0, sel.row_count());
+}
+
 }  // namespace parquet

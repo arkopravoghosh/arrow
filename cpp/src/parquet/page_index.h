@@ -18,12 +18,16 @@
 #pragma once
 
 #include "arrow/io/interfaces.h"
+#include "arrow/result.h"
 #include "parquet/encryption/type_fwd.h"
 #include "parquet/index_location.h"
+#include "parquet/row_selection.h"
 #include "parquet/type_fwd.h"
 #include "parquet/types.h"
 
+#include <any>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace parquet {
@@ -87,6 +91,41 @@ class PARQUET_EXPORT ColumnIndex {
 
   /// \brief List of repetition level histograms for each page concatenated together.
   virtual const std::vector<int64_t>& repetition_level_histograms() const = 0;
+
+  /// \brief Evaluate a predicate against per-page min/max statistics to produce a
+  /// RowSelection.
+  ///
+  /// Filters pages based on whether they can possibly contain rows matching the given
+  /// predicate.  Returns a RowSelection where skip=true for pages that cannot match
+  /// and skip=false for pages that might.
+  ///
+  /// This is conservative: a page is only skipped if the predicate can NEVER be
+  /// satisfied by any value in the page's [min, max] range.  Pages with unknown
+  /// statistics (e.g., all-null pages) are never skipped.
+  ///
+  /// Used by query engines for page-level pruning during scans.
+  ///
+  /// \param predicate_value  The scalar value to compare against (type must
+  ///        match the column's physical type; unused for IS_NULL / IS_NOT_NULL).
+  /// \param op   The comparison operator to apply.
+  /// \param offset_index  Provides per-page first_row_index values used to map
+  ///        page selections to row ranges.
+  /// \param row_group_row_count  Total rows in the row group (needed to
+  ///        derive the row count of the last page).
+  /// \returns RowSelection where skip=true for pages that cannot match, or
+  ///          Status::NotImplemented if the concrete type does not support
+  ///          predicate evaluation, or Status::Invalid if the indices are malformed.
+  ///
+  /// \note API EXPERIMENTAL
+  ///
+  /// Non-pure with a NotImplemented default so that adding this method does not
+  /// break the ABI of external ColumnIndex subclasses.
+  virtual ::arrow::Result<RowSelection> FilterPages(
+      const std::any& predicate_value, PredicateOp op, const OffsetIndex& offset_index,
+      int64_t row_group_row_count) const {
+    return ::arrow::Status::NotImplemented(
+        "FilterPages is not implemented by this ColumnIndex");
+  }
 };
 
 /// \brief Typed implementation of ColumnIndex.

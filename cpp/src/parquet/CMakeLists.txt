@@ -186,6 +186,7 @@ set(PARQUET_SRCS
     platform.cc
     printer.cc
     properties.cc
+    row_selection.cc
     schema.cc
     size_statistics.cc
     statistics.cc
@@ -383,6 +384,7 @@ add_parquet_test(internals-test
                  page_index_test.cc
                  properties_test.cc
                  public_api_test.cc
+                 row_selection_test.cc
                  size_statistics_test.cc
                  statistics_test.cc
                  types_test.cc)

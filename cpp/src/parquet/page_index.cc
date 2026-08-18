@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <any>
 #include <limits>
 #include <numeric>
 
 #include "arrow/io/interfaces.h"
+#include "arrow/result.h"
+#include "arrow/status.h"
 #include "arrow/util/int_util_overflow.h"
 #include "arrow/util/logging_internal.h"
 #include "arrow/util/unreachable.h"
@@ -94,7 +97,7 @@ class TypedColumnIndexImpl : public TypedColumnIndex<DType> {
   using T = typename DType::c_type;
 
   TypedColumnIndexImpl(const ColumnDescriptor& descr, format::ColumnIndex column_index)
-      : column_index_(std::move(column_index)) {
+      : descr_(&descr), column_index_(std::move(column_index)) {
     // Make sure the number of pages is valid and it does not overflow to int32_t.
     const size_t num_pages = column_index_.null_pages.size();
     if (num_pages >= static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
@@ -177,7 +180,123 @@ class TypedColumnIndexImpl : public TypedColumnIndex<DType> {
     return column_index_.repetition_level_histograms;
   }
 
+  ::arrow::Result<RowSelection> FilterPages(const std::any& predicate_value,
+                                            PredicateOp op,
+                                            const OffsetIndex& offset_index,
+                                            int64_t row_group_row_count) const override {
+    // Extract the typed predicate value (not needed for null operators).
+    T typed_value{};
+    if (op != PredicateOp::IS_NULL && op != PredicateOp::IS_NOT_NULL) {
+      if (predicate_value.type() != typeid(T)) {
+        return ::arrow::Status::TypeError(
+            "FilterPages: predicate value type does not match column physical type");
+      }
+      typed_value = std::any_cast<T>(predicate_value);
+    }
+
+    // Build a comparator for this column's physical type and sort order.
+    // comparator->Compare(a, b) returns true iff a < b.
+    std::shared_ptr<TypedComparator<DType>> comparator;
+    if (op != PredicateOp::IS_NULL && op != PredicateOp::IS_NOT_NULL) {
+      try {
+        comparator = MakeComparator<DType>(descr_);
+      } catch (const ParquetException&) {
+        // If we cannot build a comparator, conservatively select all pages.
+        return ::arrow::Status::NotImplemented(
+            "FilterPages: cannot build comparator for this column type");
+      }
+    }
+
+    const auto& page_locs = offset_index.page_locations();
+    const auto& null_pgs = column_index_.null_pages;
+    const size_t num_pages = null_pgs.size();
+
+    if (num_pages == 0) {
+      return RowSelection{};
+    }
+
+    if (page_locs.size() < num_pages) {
+      return ::arrow::Status::Invalid("OffsetIndex has fewer pages (", page_locs.size(),
+                                      ") than ColumnIndex (", num_pages,
+                                      "); indices are malformed");
+    }
+
+    std::vector<RowSelector> selectors;
+    selectors.reserve(num_pages);
+
+    for (size_t i = 0; i < num_pages; ++i) {
+      // Compute row count for this page.
+      int64_t first_row = page_locs[i].first_row_index;
+      int64_t last_row_exclusive =
+          (i + 1 < num_pages) ? page_locs[i + 1].first_row_index : row_group_row_count;
+      int64_t page_row_count = last_row_exclusive - first_row;
+
+      bool skip = false;
+
+      if (null_pgs[i]) {
+        // All-null page.
+        switch (op) {
+          case PredicateOp::IS_NULL:
+            // IS_NULL matches null rows — do not skip.
+            skip = false;
+            break;
+          case PredicateOp::IS_NOT_NULL:
+            // IS_NOT_NULL cannot match an all-null page — skip.
+            skip = true;
+            break;
+          default:
+            // Value predicates cannot match null values — skip.
+            skip = true;
+            break;
+        }
+      } else {
+        // Non-null page: use min/max to evaluate value predicates.
+        switch (op) {
+          case PredicateOp::IS_NULL:
+            // Page has non-null data; IS_NULL can only match if there are also
+            // some null values.  Since we cannot guarantee that from min/max
+            // alone, conservatively do NOT skip.
+            skip = false;
+            break;
+          case PredicateOp::IS_NOT_NULL:
+            // At least some values are non-null — do not skip.
+            skip = false;
+            break;
+          case PredicateOp::GT:
+            // Keep rows where value > threshold; skip if no row can match, i.e.
+            // max <= threshold  ↔  !(threshold < max)  ↔  !Compare(threshold, max).
+            skip = !comparator->Compare(typed_value, max_values_[i]);
+            break;
+          case PredicateOp::GTE:
+            // Skip if max < value
+            skip = comparator->Compare(max_values_[i], typed_value);
+            break;
+          case PredicateOp::LT:
+            // Keep rows where value < threshold; skip if no row can match, i.e.
+            // min >= threshold  ↔  !(min < threshold)  ↔  !Compare(min, threshold).
+            skip = !comparator->Compare(min_values_[i], typed_value);
+            break;
+          case PredicateOp::LTE:
+            // Skip if min > value
+            skip = comparator->Compare(typed_value, min_values_[i]);
+            break;
+          case PredicateOp::EQ:
+            // Skip if value < min  OR  max < value
+            skip = comparator->Compare(typed_value, min_values_[i]) ||
+                   comparator->Compare(max_values_[i], typed_value);
+            break;
+        }
+      }
+
+      selectors.emplace_back(skip, page_row_count);
+    }
+
+    return RowSelection(std::move(selectors));
+  }
+
  private:
+  /// The column descriptor (not owned; must outlive this object).
+  const ColumnDescriptor* descr_;
   /// Wrapped thrift column index.
   const format::ColumnIndex column_index_;
   /// Decoded typed min/max values. Undefined for null pages.
