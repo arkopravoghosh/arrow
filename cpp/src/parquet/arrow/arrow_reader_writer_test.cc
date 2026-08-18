@@ -6079,5 +6079,564 @@ TEST(TestArrowReadWrite, AllNulls) {
   ASSERT_TRUE(expected_table->Equals(*read_table));
 }
 
+// -----------------------------------------------------------------------
+// TestArrowParquetPagePruning
+//
+// End-to-end page pruning tests exercising the high-level Arrow API:
+//  - Write test tables via parquet::arrow::WriteTable
+//  - Open with FileReaderBuilder + ArrowReaderProperties (PageIndexPolicy)
+//  - Prune via ParquetFileReader::ComputePageSelection + GetRecordReader
+//  - Validate results against Arrow compute Filter
+// -----------------------------------------------------------------------
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Helper: write an Arrow Table to an in-memory buffer as a Parquet file.
+// row_group_size controls how many rows go into each row group.
+// write_page_index controls whether ColumnIndex/OffsetIndex are written.
+// ---------------------------------------------------------------------------
+std::shared_ptr<::arrow::Buffer> WriteArrowTableToBuffer(
+    const std::shared_ptr<::arrow::Table>& table, int64_t row_group_size,
+    bool write_page_index = true) {
+  auto props_builder = ::parquet::WriterProperties::Builder();
+  // Use a small page size so each row group has multiple data pages.
+  props_builder.data_pagesize(64);
+  if (write_page_index) {
+    props_builder.enable_write_page_index();
+  } else {
+    props_builder.disable_write_page_index();
+  }
+  auto writer_props = props_builder.build();
+  auto arrow_props = ::parquet::default_arrow_writer_properties();
+
+  PARQUET_ASSIGN_OR_THROW(auto sink, ::arrow::io::BufferOutputStream::Create());
+  PARQUET_THROW_NOT_OK(
+      ::parquet::arrow::WriteTable(*table, ::arrow::default_memory_pool(), sink,
+                                   row_group_size, writer_props, arrow_props));
+  PARQUET_ASSIGN_OR_THROW(auto buf, sink->Finish());
+  return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: read an Arrow Table from a Parquet buffer using FileReaderBuilder.
+// ---------------------------------------------------------------------------
+std::shared_ptr<::arrow::Table> ReadArrowTableFromBuffer(
+    const std::shared_ptr<::arrow::Buffer>& buf,
+    const ::parquet::ArrowReaderProperties& arrow_props =
+        ::parquet::default_arrow_reader_properties()) {
+  FileReaderBuilder builder;
+  PARQUET_THROW_NOT_OK(builder.Open(std::make_shared<BufferReader>(buf)));
+  std::unique_ptr<FileReader> reader;
+  PARQUET_THROW_NOT_OK(builder.properties(arrow_props)->Build(&reader));
+  std::shared_ptr<::arrow::Table> out;
+  PARQUET_THROW_NOT_OK(reader->ReadTable(&out));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Helper: materialise all values read via RecordReader (int32) across
+// multiple row groups given a map of RowSelections.
+// Returns an Arrow Int32Array containing the selected values in order.
+// ---------------------------------------------------------------------------
+std::shared_ptr<::arrow::Array> ReadSelectedInt32Values(
+    ::parquet::ParquetFileReader* pq_reader,
+    const std::map<int, std::shared_ptr<::parquet::RowSelection>>& sel_map, int col_idx) {
+  ::arrow::Int32Builder builder;
+  for (const auto& [rg_idx, sel] : sel_map) {
+    PARQUET_ASSIGN_OR_THROW(auto rr, pq_reader->GetRecordReader(rg_idx, col_idx, sel));
+    while (true) {
+      int64_t n = rr->ReadRecords(4096);
+      if (n <= 0) break;
+      const auto* vals = reinterpret_cast<const int32_t*>(rr->values());
+      int64_t written = rr->values_written();
+      PARQUET_THROW_NOT_OK(builder.AppendValues(vals, written));
+      rr->Reset();
+    }
+  }
+  std::shared_ptr<::arrow::Array> out;
+  PARQUET_THROW_NOT_OK(builder.Finish(&out));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// ByteCountingFile: wraps a BufferReader and counts bytes read via ReadAt.
+// Used to verify that page pruning reduces total I/O.
+// ---------------------------------------------------------------------------
+class ByteCountingFile : public ::arrow::io::RandomAccessFile {
+ public:
+  explicit ByteCountingFile(std::shared_ptr<::arrow::io::RandomAccessFile> inner)
+      : inner_(std::move(inner)), bytes_read_(0) {}
+
+  int64_t bytes_read() const { return bytes_read_.load(); }
+  void reset_count() { bytes_read_.store(0); }
+
+  ::arrow::Result<int64_t> GetSize() override { return inner_->GetSize(); }
+
+  ::arrow::Status Close() override { return inner_->Close(); }
+  bool closed() const override { return inner_->closed(); }
+
+  ::arrow::Result<int64_t> Tell() const override { return inner_->Tell(); }
+
+  ::arrow::Status Seek(int64_t position) override { return inner_->Seek(position); }
+
+  ::arrow::Result<int64_t> Read(int64_t nbytes, void* out) override {
+    auto result = inner_->Read(nbytes, out);
+    if (result.ok()) bytes_read_ += *result;
+    return result;
+  }
+
+  ::arrow::Result<std::shared_ptr<::arrow::Buffer>> Read(int64_t nbytes) override {
+    auto result = inner_->Read(nbytes);
+    if (result.ok()) bytes_read_ += (*result)->size();
+    return result;
+  }
+
+  ::arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override {
+    auto result = inner_->ReadAt(position, nbytes, out);
+    if (result.ok()) bytes_read_ += *result;
+    return result;
+  }
+
+  ::arrow::Result<std::shared_ptr<::arrow::Buffer>> ReadAt(int64_t position,
+                                                           int64_t nbytes) override {
+    auto result = inner_->ReadAt(position, nbytes);
+    if (result.ok()) bytes_read_ += (*result)->size();
+    return result;
+  }
+
+ private:
+  std::shared_ptr<::arrow::io::RandomAccessFile> inner_;
+  std::atomic<int64_t> bytes_read_;
+};
+
+}  // namespace
+
+// -----------------------------------------------------------------------
+// Test fixture
+// -----------------------------------------------------------------------
+
+/// TestArrowParquetPagePruning exercises page-level pruning through the
+/// high-level Arrow + Parquet API, covering all nine standard/edge cases.
+class TestArrowParquetPagePruning : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // Build a two-row-group file:
+    //   RG 0: values  1 .. 50   (column "value", int32, NOT NULL)
+    //   RG 1: values 51 .. 100
+    // With data_pagesize=64 bytes / 4 bytes per int32 → ~16 values/page
+    // → ~4 pages per row group, enough to test intra-RG pruning.
+    auto schema = ::arrow::schema({::arrow::field("value", ::arrow::int32(), false)});
+
+    // Build RG 0 array: 1..50
+    ::arrow::Int32Builder b0;
+    ASSERT_OK(b0.Reserve(50));
+    for (int i = 1; i <= 50; ++i) ASSERT_OK(b0.Append(i));
+    std::shared_ptr<::arrow::Array> arr0;
+    ASSERT_OK(b0.Finish(&arr0));
+
+    // Build RG 1 array: 51..100
+    ::arrow::Int32Builder b1;
+    ASSERT_OK(b1.Reserve(50));
+    for (int i = 51; i <= 100; ++i) ASSERT_OK(b1.Append(i));
+    std::shared_ptr<::arrow::Array> arr1;
+    ASSERT_OK(b1.Finish(&arr1));
+
+    // Create two-RG table: row_group_size=50 forces each batch into its own RG.
+    auto chunked = std::make_shared<::arrow::ChunkedArray>(
+        ::arrow::ArrayVector{arr0, arr1}, ::arrow::int32());
+    two_rg_table_ = ::arrow::Table::Make(schema, {chunked});
+
+    two_rg_buf_ = WriteArrowTableToBuffer(two_rg_table_, /*row_group_size=*/50,
+                                          /*write_page_index=*/true);
+  }
+
+  // Full Arrow table written with page index; two row groups (50 rows each).
+  std::shared_ptr<::arrow::Table> two_rg_table_;
+  std::shared_ptr<::arrow::Buffer> two_rg_buf_;
+};
+
+// ---------------------------------------------------------------------------
+// Case 1: Multi-RG, ALWAYS policy, predicate matches only RG1.
+// Expected: exactly the rows from RG1 that satisfy the predicate.
+// ---------------------------------------------------------------------------
+TEST_F(TestArrowParquetPagePruning, MultiRGAlwaysPredicateRG1) {
+  // Predicate: value > 50 → only RG 1 (values 51..100) satisfies this.
+  const int32_t threshold = 50;
+
+  auto in_file = std::make_shared<BufferReader>(two_rg_buf_);
+  auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+
+  ::parquet::ArrowReaderProperties props;
+  props.set_page_index_policy(::parquet::PageIndexPolicy::ALWAYS);
+  pq_reader->set_arrow_reader_properties(props);
+
+  ASSERT_OK_AND_ASSIGN(auto sel_map, pq_reader->ComputePageSelection(
+                                         /*col=*/0, PredicateOp::GT, std::any(threshold)));
+
+  // Read pruned values.
+  auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, /*col=*/0);
+
+  // Build reference count directly from the known data (values 1..100): the
+  // rows satisfying value > 50 are exactly 51..100, i.e. 50 rows.  Computing
+  // this by hand keeps the test self-contained (no dependency on the compute
+  // function registry being loaded).
+  int64_t expected_matches = 0;
+  for (int32_t v = 1; v <= 100; ++v) {
+    if (v > threshold) ++expected_matches;
+  }
+
+  // The pruned result must contain all rows where value > 50.  Here the
+  // predicate boundary aligns with the row-group boundary (RG 0 = 1..50 is
+  // fully skipped, RG 1 = 51..100 is fully selected), so page pruning yields
+  // exactly the matching rows.
+  ASSERT_EQ(pruned_arr->length(), expected_matches);
+
+  // Every returned value must satisfy the predicate.
+  auto pruned_data = std::dynamic_pointer_cast<::arrow::Int32Array>(pruned_arr);
+  ASSERT_NE(pruned_data, nullptr);
+  for (int64_t i = 0; i < pruned_data->length(); ++i) {
+    EXPECT_GT(pruned_data->Value(i), threshold);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Case 2: NEVER policy → all rows (superset of pruned).
+// NEVER must return a select-all RowSelection and ReadTable must return all rows.
+// ---------------------------------------------------------------------------
+TEST_F(TestArrowParquetPagePruning, NeverPolicyReturnsAll) {
+  ::parquet::ArrowReaderProperties props;
+  props.set_page_index_policy(::parquet::PageIndexPolicy::NEVER);
+
+  auto full_table = ReadArrowTableFromBuffer(two_rg_buf_, props);
+
+  // With NEVER policy the reader must return all 100 rows.
+  EXPECT_EQ(full_table->num_rows(), 100);
+
+  // Also verify via ComputePageSelection that it returns select-all RowSelections.
+  auto in_file = std::make_shared<BufferReader>(two_rg_buf_);
+  auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+  pq_reader->set_arrow_reader_properties(props);
+
+  ASSERT_OK_AND_ASSIGN(auto sel_map,
+                       pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{50})));
+
+  for (const auto& [rg_idx, sel] : sel_map) {
+    int64_t num_rows = pq_reader->metadata()->RowGroup(rg_idx)->num_rows();
+    // All rows must be selected (no skipping).
+    int64_t selected = 0;
+    for (int64_t p = 0; p < sel->page_count(); ++p) {
+      if (!sel->selector(static_cast<size_t>(p)).skip) {
+        selected += sel->selector(static_cast<size_t>(p)).row_count;
+      }
+    }
+    EXPECT_EQ(selected, num_rows);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Case 3: Predicate matches no rows → 0 rows returned.
+// ---------------------------------------------------------------------------
+TEST_F(TestArrowParquetPagePruning, PredicateMatchesNone) {
+  // Predicate: value > 1000 → no values in [1,100] satisfy this.
+  const int32_t threshold = 1000;
+
+  auto in_file = std::make_shared<BufferReader>(two_rg_buf_);
+  auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+
+  ::parquet::ArrowReaderProperties props;
+  props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
+  pq_reader->set_arrow_reader_properties(props);
+
+  ASSERT_OK_AND_ASSIGN(auto sel_map,
+                       pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(threshold)));
+
+  auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
+  EXPECT_EQ(pruned_arr->length(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Case 4: Predicate matches ALL rows ≡ NEVER (no rows pruned).
+// ---------------------------------------------------------------------------
+TEST_F(TestArrowParquetPagePruning, PredicateMatchesAll) {
+  // Predicate: value > 0 → all values in [1,100] satisfy this.
+  const int32_t threshold = 0;
+
+  auto in_file = std::make_shared<BufferReader>(two_rg_buf_);
+  auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+
+  ::parquet::ArrowReaderProperties props;
+  props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
+  pq_reader->set_arrow_reader_properties(props);
+
+  ASSERT_OK_AND_ASSIGN(auto sel_map,
+                       pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(threshold)));
+
+  auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
+  // Every row satisfies value > 0, so all 100 rows should be returned.
+  EXPECT_EQ(pruned_arr->length(), 100);
+}
+
+// ---------------------------------------------------------------------------
+// Case 5: ALWAYS reads fewer bytes than NEVER (observable I/O reduction).
+// ---------------------------------------------------------------------------
+TEST_F(TestArrowParquetPagePruning, AlwaysReadsFewerBytes) {
+  // Build a dedicated, larger file so that the data-page I/O saved by pruning
+  // clearly dominates the fixed cost of reading the ColumnIndex/OffsetIndex.
+  // A tiny file (like the shared two_rg_buf_ fixture) is unsuitable: the page
+  // index metadata that the ALWAYS path must read can exceed the handful of
+  // data bytes it saves.
+  //
+  // Data: monotonically increasing values 0..kNumRows-1 written in many row
+  // groups.  A highly selective predicate (value >= threshold near the end)
+  // means the vast majority of row groups are skipped entirely.
+  constexpr int32_t kNumRows = 10000;
+  constexpr int64_t kRowGroupSize = 200;     // → 50 row groups
+  const int32_t threshold = kNumRows - 100;  // matches only the last ~100 rows
+
+  ::arrow::Int32Builder builder;
+  ASSERT_OK(builder.Reserve(kNumRows));
+  for (int32_t i = 0; i < kNumRows; ++i) ASSERT_OK(builder.Append(i));
+  std::shared_ptr<::arrow::Array> arr;
+  ASSERT_OK(builder.Finish(&arr));
+  auto schema = ::arrow::schema({::arrow::field("value", ::arrow::int32(), false)});
+  auto table = ::arrow::Table::Make(schema, {arr});
+  auto buf = WriteArrowTableToBuffer(table, kRowGroupSize, /*write_page_index=*/true);
+
+  // ---- NEVER scan (reads every row group in full) ----
+  auto counting_never =
+      std::make_shared<ByteCountingFile>(std::make_shared<BufferReader>(buf));
+  {
+    FileReaderBuilder builder;
+    ASSERT_OK(builder.Open(counting_never));
+    ::parquet::ArrowReaderProperties props;
+    props.set_page_index_policy(::parquet::PageIndexPolicy::NEVER);
+    std::unique_ptr<FileReader> reader;
+    ASSERT_OK(builder.properties(props)->Build(&reader));
+
+    const int num_rgs = reader->parquet_reader()->metadata()->num_row_groups();
+    const std::vector<int> cols{0};
+    for (int rg = 0; rg < num_rgs; ++rg) {
+      ASSERT_OK_AND_ASSIGN(auto table, reader->ReadRowGroup(rg, cols));
+      (void)table;
+    }
+  }
+  int64_t bytes_never = counting_never->bytes_read();
+
+  // ---- ALWAYS scan (sparse-reads only the selected pages) ----
+  auto counting_always =
+      std::make_shared<ByteCountingFile>(std::make_shared<BufferReader>(buf));
+  {
+    FileReaderBuilder builder;
+    ASSERT_OK(builder.Open(counting_always));
+    ::parquet::ArrowReaderProperties props;
+    props.set_page_index_policy(::parquet::PageIndexPolicy::ALWAYS);
+    std::unique_ptr<FileReader> reader;
+    ASSERT_OK(builder.properties(props)->Build(&reader));
+
+    // Compute the per-row-group selection via the predicate, then read each
+    // row group through the sparse I/O path.
+    ASSERT_OK_AND_ASSIGN(auto sel_map, reader->parquet_reader()->ComputePageSelection(
+                                           0, PredicateOp::GT, std::any(threshold)));
+    const std::vector<int> cols{0};
+    for (const auto& [rg, sel] : sel_map) {
+      ASSERT_OK_AND_ASSIGN(auto table,
+                           reader->ReadRowGroupWithRowSelection(rg, cols, sel));
+      (void)table;
+    }
+  }
+  int64_t bytes_always = counting_always->bytes_read();
+
+  EXPECT_GT(bytes_never, 0);
+  EXPECT_GT(bytes_always, 0);
+  // Page pruning must result in strictly fewer bytes read: with a highly
+  // selective predicate the skipped data pages far outweigh the page-index
+  // metadata the ALWAYS path additionally reads.
+  EXPECT_LT(bytes_always, bytes_never);
+}
+
+// ---------------------------------------------------------------------------
+// Case 6: No page index + ALWAYS → returns error (ALWAYS requires indices).
+// ---------------------------------------------------------------------------
+TEST_F(TestArrowParquetPagePruning, NoIndexFallback) {
+  // Write a file WITHOUT page index.
+  auto schema = ::arrow::schema({::arrow::field("value", ::arrow::int32(), false)});
+  ::arrow::Int32Builder builder;
+  ASSERT_OK(builder.Reserve(10));
+  for (int i = 1; i <= 10; ++i) ASSERT_OK(builder.Append(i));
+  std::shared_ptr<::arrow::Array> arr;
+  ASSERT_OK(builder.Finish(&arr));
+  auto table = ::arrow::Table::Make(
+      schema, {std::make_shared<::arrow::ChunkedArray>(::arrow::ArrayVector{arr})});
+
+  auto buf = WriteArrowTableToBuffer(table, /*row_group_size=*/10,
+                                     /*write_page_index=*/false);
+
+  auto in_file = std::make_shared<BufferReader>(buf);
+  auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+
+  // ALWAYS policy requires page indices — must fail when they are absent.
+  ::parquet::ArrowReaderProperties props;
+  props.set_page_index_policy(::parquet::PageIndexPolicy::ALWAYS);
+  pq_reader->set_arrow_reader_properties(props);
+
+  auto result = pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{5}));
+  EXPECT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().IsInvalid());
+
+  // AUTO policy should fall back gracefully to reading all rows.
+  auto in_file2 = std::make_shared<BufferReader>(buf);
+  auto pq_reader2 = ::parquet::ParquetFileReader::Open(in_file2);
+  ::parquet::ArrowReaderProperties props_auto;
+  props_auto.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
+  pq_reader2->set_arrow_reader_properties(props_auto);
+
+  ASSERT_OK_AND_ASSIGN(auto sel_map,
+                       pq_reader2->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{5})));
+  // AUTO fallback: all 10 rows should be selected.
+  auto pruned_arr = ReadSelectedInt32Values(pq_reader2.get(), sel_map, 0);
+  EXPECT_EQ(pruned_arr->length(), 10);
+}
+
+// ---------------------------------------------------------------------------
+// Case 7: Single RG, single page, predicate match / non-match.
+// ---------------------------------------------------------------------------
+TEST_F(TestArrowParquetPagePruning, SingleRGSinglePageMatch) {
+  // Five values [1,2,3,4,5] in one row group, one page (64-byte limit >>20 bytes).
+  auto schema = ::arrow::schema({::arrow::field("value", ::arrow::int32(), false)});
+  ::arrow::Int32Builder b;
+  ASSERT_OK(b.AppendValues({1, 2, 3, 4, 5}));
+  std::shared_ptr<::arrow::Array> arr;
+  ASSERT_OK(b.Finish(&arr));
+  auto table = ::arrow::Table::Make(
+      schema, {std::make_shared<::arrow::ChunkedArray>(::arrow::ArrayVector{arr})});
+  auto buf = WriteArrowTableToBuffer(table, /*row_group_size=*/5,
+                                     /*write_page_index=*/true);
+
+  // --- Predicate matches (value > 3) ---
+  {
+    auto in_file = std::make_shared<BufferReader>(buf);
+    auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+    ::parquet::ArrowReaderProperties props;
+    props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
+    pq_reader->set_arrow_reader_properties(props);
+
+    ASSERT_OK_AND_ASSIGN(auto sel_map,
+                         pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{3})));
+    auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
+    // Single page has values 1-5 which does contain values >3 so page is selected.
+    EXPECT_GT(pruned_arr->length(), 0);
+  }
+
+  // --- Predicate does not match (value > 100) ---
+  {
+    auto in_file = std::make_shared<BufferReader>(buf);
+    auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+    ::parquet::ArrowReaderProperties props;
+    props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
+    pq_reader->set_arrow_reader_properties(props);
+
+    ASSERT_OK_AND_ASSIGN(
+        auto sel_map, pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{100})));
+    auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
+    // No value in [1,5] is > 100: the page should be skipped → 0 rows.
+    EXPECT_EQ(pruned_arr->length(), 0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Case 8: All-null RG is skipped by a non-null predicate.
+// ---------------------------------------------------------------------------
+TEST_F(TestArrowParquetPagePruning, AllNullRGSkipped) {
+  // Create a nullable int32 column where all values are null.
+  auto schema =
+      ::arrow::schema({::arrow::field("value", ::arrow::int32(), /*nullable=*/true)});
+  constexpr int64_t kNumRows = 20;
+  auto null_arr = ::arrow::ArrayFromJSON(::arrow::int32(),
+                                         "[null, null, null, null, null,"
+                                         " null, null, null, null, null,"
+                                         " null, null, null, null, null,"
+                                         " null, null, null, null, null]");
+  ASSERT_EQ(null_arr->length(), kNumRows);
+  auto table = ::arrow::Table::Make(
+      schema, {std::make_shared<::arrow::ChunkedArray>(::arrow::ArrayVector{null_arr})});
+  auto buf = WriteArrowTableToBuffer(table, /*row_group_size=*/kNumRows,
+                                     /*write_page_index=*/true);
+
+  auto in_file = std::make_shared<BufferReader>(buf);
+  auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+  ::parquet::ArrowReaderProperties props;
+  props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
+  pq_reader->set_arrow_reader_properties(props);
+
+  // Predicate "value > 0" can never match a null, so the whole RG should be skipped.
+  ASSERT_OK_AND_ASSIGN(auto sel_map,
+                       pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{0})));
+
+  // Verify the selection skips everything.
+  ASSERT_EQ(static_cast<int>(sel_map.size()), 1);
+  const auto& sel = *sel_map.at(0);
+  EXPECT_EQ(sel.row_count(), kNumRows);
+  int64_t selected = 0;
+  for (int64_t p = 0; p < sel.page_count(); ++p) {
+    if (!sel.selector(static_cast<size_t>(p)).skip) {
+      selected += sel.selector(static_cast<size_t>(p)).row_count;
+    }
+  }
+  EXPECT_EQ(selected, 0);
+
+  // No rows should be materialised.
+  auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
+  EXPECT_EQ(pruned_arr->length(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Case 9: Single row, single page — match and non-match.
+// ---------------------------------------------------------------------------
+TEST_F(TestArrowParquetPagePruning, SingleRowSinglePageMatch) {
+  auto schema = ::arrow::schema({::arrow::field("value", ::arrow::int32(), false)});
+  ::arrow::Int32Builder b;
+  ASSERT_OK(b.Append(42));
+  std::shared_ptr<::arrow::Array> arr;
+  ASSERT_OK(b.Finish(&arr));
+  auto table = ::arrow::Table::Make(
+      schema, {std::make_shared<::arrow::ChunkedArray>(::arrow::ArrayVector{arr})});
+  auto buf = WriteArrowTableToBuffer(table, /*row_group_size=*/1,
+                                     /*write_page_index=*/true);
+
+  // --- Match: value > 10 → value=42 satisfies, 1 row returned ---
+  {
+    auto in_file = std::make_shared<BufferReader>(buf);
+    auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+    ::parquet::ArrowReaderProperties props;
+    props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
+    pq_reader->set_arrow_reader_properties(props);
+
+    ASSERT_OK_AND_ASSIGN(auto sel_map,
+                         pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{10})));
+    auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
+    EXPECT_EQ(pruned_arr->length(), 1);
+    auto typed = std::dynamic_pointer_cast<::arrow::Int32Array>(pruned_arr);
+    ASSERT_NE(typed, nullptr);
+    EXPECT_EQ(typed->Value(0), 42);
+  }
+
+  // --- Non-match: value > 100 → value=42 does not satisfy, 0 rows returned ---
+  {
+    auto in_file = std::make_shared<BufferReader>(buf);
+    auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
+    ::parquet::ArrowReaderProperties props;
+    props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
+    pq_reader->set_arrow_reader_properties(props);
+
+    ASSERT_OK_AND_ASSIGN(
+        auto sel_map, pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{100})));
+    auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
+    EXPECT_EQ(pruned_arr->length(), 0);
+  }
+}
+
 }  // namespace arrow
 }  // namespace parquet

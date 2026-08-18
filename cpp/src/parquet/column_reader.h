@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/io/interfaces.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/macros.h"
 #include "parquet/exception.h"
@@ -29,6 +30,7 @@
 #include "parquet/metadata.h"
 #include "parquet/platform.h"
 #include "parquet/properties.h"
+#include "parquet/row_selection.h"
 #include "parquet/schema.h"
 #include "parquet/types.h"
 
@@ -173,6 +175,89 @@ class PARQUET_EXPORT PageReader {
  protected:
   // Callback that decides if we should skip a page or not.
   DataPageFilter data_page_filter_;
+};
+
+/// \brief A sequential InputStream wrapper that reads only selected byte ranges
+/// from an underlying RandomAccessFile, skipping over pruned pages efficiently.
+///
+/// SparseInputStream exposes a sequential InputStream view over a subset of
+/// byte ranges within a Parquet column chunk.  When a RowSelection is applied
+/// alongside an OffsetIndex, only the pages that overlap selected rows are
+/// included in read_ranges; SparseInputStream is then used in place of the
+/// ordinary sequential stream so that pruned pages are never fetched.
+///
+/// The logical position advances through the concatenated extents of
+/// read_ranges.  Seek() and Tell() operate in this logical space.
+///
+/// \note API EXPERIMENTAL
+class PARQUET_EXPORT SparseInputStream : public ::arrow::io::RandomAccessFile {
+ public:
+  /// \brief Construct a SparseInputStream over a source file.
+  ///
+  /// \param source         The underlying RandomAccessFile to read from.
+  /// \param read_ranges    Sorted, non-overlapping byte ranges to expose.
+  ///                       Ranges must lie within the file bounds and must not
+  ///                       overlap.  An empty vector is valid (yields EOF).
+  SparseInputStream(std::shared_ptr<::arrow::io::RandomAccessFile> source,
+                    std::vector<::arrow::io::ReadRange> read_ranges);
+
+  // -------------------------------------------------------------------------
+  // arrow::io::RandomAccessFile interface
+
+  /// \brief Read up to nbytes from the current logical position.
+  ///
+  /// Advances through the sparse ranges in order.  When the end of one range
+  /// is reached the read continues from the start of the next range; bytes
+  /// between ranges (pruned pages) are never fetched from the source.
+  ///
+  /// Returns an empty buffer at logical EOF (all ranges exhausted).
+  ::arrow::Result<std::shared_ptr<::arrow::Buffer>> Read(int64_t nbytes) override;
+
+  /// \brief Read up to nbytes into caller-supplied buffer.
+  ::arrow::Result<int64_t> Read(int64_t nbytes, void* out) override;
+
+  /// \brief Seek to a logical position within the concatenated read ranges.
+  ///
+  /// \param position  Zero-based byte offset in the logical stream formed by
+  ///                  concatenating all read_ranges in order.
+  /// \returns Status::IOError if position is negative or beyond GetSize().
+  ::arrow::Status Seek(int64_t position) override;
+
+  /// \brief Return the current logical position (bytes consumed so far).
+  ::arrow::Result<int64_t> Tell() const override;
+
+  /// \brief Return the total logical size (sum of all range lengths).
+  ::arrow::Result<int64_t> GetSize() override;
+
+  /// \brief Close the stream; delegates to the underlying source.
+  ::arrow::Status Close() override;
+
+  /// \brief Return whether the stream is closed.
+  bool closed() const override;
+
+  /// \brief Peek at upcoming bytes without advancing the stream position.
+  ///
+  /// Returns a view of up to nbytes starting at the current logical position.
+  /// The view is backed by an internal buffer that is valid until the next
+  /// mutating operation (Read, Seek, Advance).
+  ///
+  /// Unlike Read(), Peek() does not advance across range boundaries in a single
+  /// call — it returns at most the bytes remaining in the current range.
+  ::arrow::Result<std::string_view> Peek(int64_t nbytes) override;
+
+ private:
+  std::shared_ptr<::arrow::io::RandomAccessFile> source_;
+  std::vector<::arrow::io::ReadRange> read_ranges_;
+  /// Index into read_ranges_ of the range currently being consumed.
+  size_t current_range_index_;
+  /// Byte offset within read_ranges_[current_range_index_].
+  int64_t position_in_range_;
+  /// Total bytes consumed across all completed and partial ranges.
+  int64_t logical_position_;
+  /// Cached sum of all range lengths (logical EOF boundary).
+  int64_t total_size_;
+  /// Internal buffer used by Peek() to materialise the view.
+  std::shared_ptr<::arrow::Buffer> peek_buffer_;
 };
 
 class PARQUET_EXPORT ColumnReader {
@@ -334,6 +419,23 @@ class PARQUET_EXPORT RecordReader {
   /// any records could be read/skipped.
   /// \param[in] reader obtained from RowGroupReader::GetColumnPageReader
   virtual void SetPageReader(std::unique_ptr<PageReader> reader) = 0;
+
+  /// \brief Set a RowSelection to control which row ranges are read vs skipped.
+  ///
+  /// If set, ReadRecords() and SkipRecords() will respect this selection:
+  /// selectors with skip=true are skipped, selectors with skip=false are read.
+  /// If not set (nullptr), all rows are read sequentially (current behavior).
+  ///
+  /// \note API EXPERIMENTAL
+  virtual ::arrow::Status SetRowSelection(
+      std::shared_ptr<RowSelection> row_selection) = 0;
+
+  /// \brief Return the current RowSelection (if any).
+  ///
+  /// Returns nullptr when no RowSelection has been set.
+  ///
+  /// \note API EXPERIMENTAL
+  virtual std::shared_ptr<RowSelection> row_selection() const = 0;
 
   /// \brief Returns the underlying column reader's descriptor.
   virtual const ColumnDescriptor* descr() const = 0;

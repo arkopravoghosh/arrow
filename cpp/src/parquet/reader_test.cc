@@ -20,6 +20,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -38,6 +39,7 @@
 #include "arrow/array/builder_binary.h"
 #include "arrow/buffer.h"
 #include "arrow/io/file.h"
+#include "arrow/io/memory.h"
 #include "arrow/testing/future_util.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/random.h"
@@ -55,6 +57,7 @@
 #include "parquet/page_index.h"
 #include "parquet/platform.h"
 #include "parquet/printer.h"
+#include "parquet/row_selection.h"
 #include "parquet/statistics.h"
 #include "parquet/test_util.h"
 #include "parquet/types.h"
@@ -2122,6 +2125,411 @@ TEST_F(TestGeometryLogicalType, TestWriteGeography) {
 
 TEST_F(TestGeometryLogicalType, TestWriteGeographyArrow) {
   TestWriteAndRead(GeographyLogicalType::Make("srid:1234"), /*write_arrow=*/true);
+}
+
+// -----------------------------------------------------------------------
+// TestParquetFileReaderPagePruning
+//
+// Covers ComputePageSelection() and GetRecordReader() with RowSelection,
+// including all nine standard and edge-case scenarios from the spec.
+// -----------------------------------------------------------------------
+
+namespace {
+
+/// Build a schema with a single required INT32 column named "value".
+std::shared_ptr<GroupNode> MakeSingleInt32Schema() {
+  schema::NodeVector fields;
+  fields.push_back(PrimitiveNode::Make("value", Repetition::REQUIRED, Type::INT32,
+                                       ConvertedType::NONE));
+  return std::static_pointer_cast<GroupNode>(
+      GroupNode::Make("schema", Repetition::REQUIRED, fields));
+}
+
+/// Build a schema with a single OPTIONAL INT32 column named "value" (nullable).
+std::shared_ptr<GroupNode> MakeSingleNullableInt32Schema() {
+  schema::NodeVector fields;
+  fields.push_back(PrimitiveNode::Make("value", Repetition::OPTIONAL, Type::INT32,
+                                       ConvertedType::NONE));
+  return std::static_pointer_cast<GroupNode>(
+      GroupNode::Make("schema", Repetition::REQUIRED, fields));
+}
+
+/// Write a single-column INT32 Parquet file with page index enabled.
+/// Returns an in-memory buffer containing the file bytes.
+///
+/// \param values      Flat list of int32 values written into a single row group.
+/// \param page_size   Maximum page size in bytes (controls page count).
+/// \param write_page_index  Whether to enable writing ColumnIndex/OffsetIndex.
+std::shared_ptr<::arrow::Buffer> MakeInt32ParquetFile(const std::vector<int32_t>& values,
+                                                      int64_t page_size = 64,
+                                                      bool write_page_index = true) {
+  auto schema = MakeSingleInt32Schema();
+
+  WriterProperties::Builder props_builder;
+  props_builder.data_pagesize(page_size);
+  if (write_page_index) {
+    props_builder.enable_write_page_index();
+  } else {
+    props_builder.disable_write_page_index();
+  }
+  auto writer_props = props_builder.build();
+
+  PARQUET_ASSIGN_OR_THROW(auto out_file, ::arrow::io::BufferOutputStream::Create());
+  auto file_writer = ParquetFileWriter::Open(out_file, schema, writer_props);
+  auto* rg_writer = file_writer->AppendRowGroup();
+  auto* col_writer = static_cast<Int32Writer*>(rg_writer->NextColumn());
+  col_writer->WriteBatch(static_cast<int64_t>(values.size()), nullptr, nullptr,
+                         values.data());
+  rg_writer->Close();
+  file_writer->Close();
+
+  PARQUET_ASSIGN_OR_THROW(auto buf, out_file->Finish());
+  return buf;
+}
+
+/// Write a two-row-group INT32 Parquet file.
+/// Row group 0 contains \p rg0_values, row group 1 contains \p rg1_values.
+std::shared_ptr<::arrow::Buffer> MakeTwoRowGroupInt32File(
+    const std::vector<int32_t>& rg0_values, const std::vector<int32_t>& rg1_values,
+    int64_t page_size = 64, bool write_page_index = true) {
+  auto schema = MakeSingleInt32Schema();
+
+  WriterProperties::Builder props_builder;
+  props_builder.data_pagesize(page_size);
+  if (write_page_index) {
+    props_builder.enable_write_page_index();
+  } else {
+    props_builder.disable_write_page_index();
+  }
+  auto writer_props = props_builder.build();
+
+  PARQUET_ASSIGN_OR_THROW(auto out_file, ::arrow::io::BufferOutputStream::Create());
+  auto file_writer = ParquetFileWriter::Open(out_file, schema, writer_props);
+
+  // Row group 0
+  {
+    auto* rg_writer = file_writer->AppendRowGroup();
+    auto* col_writer = static_cast<Int32Writer*>(rg_writer->NextColumn());
+    col_writer->WriteBatch(static_cast<int64_t>(rg0_values.size()), nullptr, nullptr,
+                           rg0_values.data());
+    rg_writer->Close();
+  }
+  // Row group 1
+  {
+    auto* rg_writer = file_writer->AppendRowGroup();
+    auto* col_writer = static_cast<Int32Writer*>(rg_writer->NextColumn());
+    col_writer->WriteBatch(static_cast<int64_t>(rg1_values.size()), nullptr, nullptr,
+                           rg1_values.data());
+    rg_writer->Close();
+  }
+
+  file_writer->Close();
+  PARQUET_ASSIGN_OR_THROW(auto buf, out_file->Finish());
+  return buf;
+}
+
+/// Write a single-column OPTIONAL INT32 file where every value is null.
+std::shared_ptr<::arrow::Buffer> MakeAllNullInt32File(int64_t num_rows,
+                                                      int64_t page_size = 64,
+                                                      bool write_page_index = true) {
+  auto schema = MakeSingleNullableInt32Schema();
+
+  WriterProperties::Builder props_builder;
+  props_builder.data_pagesize(page_size);
+  if (write_page_index) {
+    props_builder.enable_write_page_index();
+  } else {
+    props_builder.disable_write_page_index();
+  }
+  auto writer_props = props_builder.build();
+
+  PARQUET_ASSIGN_OR_THROW(auto out_file, ::arrow::io::BufferOutputStream::Create());
+  auto file_writer = ParquetFileWriter::Open(out_file, schema, writer_props);
+  auto* rg_writer = file_writer->AppendRowGroup();
+  auto* col_writer = static_cast<Int32Writer*>(rg_writer->NextColumn());
+
+  // All-null: def_level = 0 for every row.
+  std::vector<int16_t> def_levels(num_rows, 0);
+  // values pointer can be nullptr when all values are null.
+  col_writer->WriteBatch(num_rows, def_levels.data(), /*rep_levels=*/nullptr,
+                         /*values=*/nullptr);
+  rg_writer->Close();
+  file_writer->Close();
+
+  PARQUET_ASSIGN_OR_THROW(auto buf, out_file->Finish());
+  return buf;
+}
+
+/// Read all INT32 values from column 0 of row group \p rg of \p reader.
+std::vector<int32_t> ReadAllInt32Values(ParquetFileReader* reader, int rg) {
+  auto rg_reader = reader->RowGroup(rg);
+  auto col_reader = std::dynamic_pointer_cast<Int32Reader>(rg_reader->Column(/*i=*/0));
+  EXPECT_NE(col_reader, nullptr);
+  std::vector<int32_t> result;
+  while (col_reader->HasNext()) {
+    constexpr int64_t kBatch = 256;
+    int32_t vals[kBatch];
+    int64_t values_read = 0;
+    col_reader->ReadBatch(kBatch, nullptr, nullptr, vals, &values_read);
+    result.insert(result.end(), vals, vals + values_read);
+  }
+  return result;
+}
+
+/// Count how many rows are *selected* (skip=false) in \p sel.
+int64_t SelectedRowCount(const RowSelection& sel) {
+  int64_t count = 0;
+  for (int64_t i = 0; i < sel.page_count(); ++i) {
+    if (!sel.selector(i).skip) {
+      count += sel.selector(i).row_count;
+    }
+  }
+  return count;
+}
+
+}  // namespace
+
+class TestParquetFileReaderPagePruning : public ::testing::Test {
+ public:
+  void SetUp() override {
+    // Build a file with two row groups so we can test single-RG predicate matches.
+    // RG 0: values 1..50, RG 1: values 51..100.
+    // With a small page size (64 bytes / 16 int32 per page) each RG gets ~4 pages.
+    std::vector<int32_t> rg0_vals(50), rg1_vals(50);
+    for (int i = 0; i < 50; ++i) {
+      rg0_vals[i] = i + 1;   // 1–50
+      rg1_vals[i] = i + 51;  // 51–100
+    }
+    // 64 bytes / 4 bytes per int32 = 16 values per page → 4 pages per RG
+    two_rg_buf_ = MakeTwoRowGroupInt32File(rg0_vals, rg1_vals, /*page_size=*/64);
+  }
+
+ protected:
+  // Two-row-group file with page index (written by SetUp).
+  std::shared_ptr<::arrow::Buffer> two_rg_buf_;
+};
+
+// Case 1: predicate that only touches one row group returns correct selected/skipped
+// counts for that RG and select-all for the other RG.
+TEST_F(TestParquetFileReaderPagePruning, ComputePageSelectionOneRG) {
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(two_rg_buf_);
+  auto reader = ParquetFileReader::Open(in_file);
+
+  // AUTO policy: use ColumnIndex when available.
+  ArrowReaderProperties arrow_props;
+  arrow_props.set_page_index_policy(PageIndexPolicy::AUTO);
+  reader->set_arrow_reader_properties(arrow_props);
+
+  // Predicate: value > 50 — matches only RG 1 (values 51–100).
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{50}));
+
+  ASSERT_EQ(2, static_cast<int>(sel_map.size()));
+
+  // RG 0 must cover its 50 rows; all should be *skipped* (no value > 50 in RG 0).
+  const auto& rg0_sel = *sel_map.at(0);
+  EXPECT_EQ(50, rg0_sel.row_count());
+  EXPECT_EQ(0, SelectedRowCount(rg0_sel));
+
+  // RG 1 must cover its 50 rows; at least some should be selected.
+  const auto& rg1_sel = *sel_map.at(1);
+  EXPECT_EQ(50, rg1_sel.row_count());
+  EXPECT_GT(SelectedRowCount(rg1_sel), 0);
+}
+
+// Case 2: GetRecordReader with the RowSelection from ComputePageSelection.
+//
+// This fixture writes RG 1 as a single data page (min=51, max=100), so a
+// value>=80 predicate cannot prune it — the page's [min,max] overlaps the
+// predicate, so it is correctly selected in full. The test therefore verifies
+// the end-to-end plumbing: ComputePageSelection yields a valid select-all
+// RowSelection for the overlapping page, and GetRecordReader with that selection
+// returns every matching value (80..100). (Intra-row-group page skipping and
+// true sparse I/O are exercised by the multi-page fixtures used in the
+// arrow-reader tests and by ReadRowGroupWithRowSelection.)
+TEST_F(TestParquetFileReaderPagePruning, GetRecordReaderWithSelection) {
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(two_rg_buf_);
+  auto reader = ParquetFileReader::Open(in_file);
+
+  ArrowReaderProperties arrow_props;
+  arrow_props.set_page_index_policy(PageIndexPolicy::AUTO);
+  reader->set_arrow_reader_properties(arrow_props);
+
+  // Predicate: value >= 80 — RG 1 holds values 51–100.
+  ASSERT_OK_AND_ASSIGN(auto sel_map,
+                       reader->ComputePageSelection(0, PredicateOp::GTE, int32_t{80}));
+
+  // The page's [min,max]=[51,100] overlaps the predicate, so it is selected; the
+  // selection covers all 50 rows of the (single-page) row group.
+  const RowSelection& rg1_sel = *sel_map.at(1);
+  EXPECT_EQ(50, rg1_sel.row_count());
+  EXPECT_GT(SelectedRowCount(rg1_sel), 0);
+
+  // Reading with the selection returns every true match (80..100).
+  ASSERT_OK_AND_ASSIGN(auto rr, reader->GetRecordReader(1, 0, sel_map.at(1)));
+  int64_t records_read = rr->ReadRecords(1000);
+  EXPECT_GT(records_read, 0);
+
+  const int32_t* values = reinterpret_cast<const int32_t*>(rr->values());
+  int64_t values_written = rr->values_written();
+  std::set<int32_t> decoded(values, values + values_written);
+  for (int32_t v = 80; v <= 100; ++v) {
+    EXPECT_TRUE(decoded.count(v) > 0) << "expected matching value " << v << " to be read";
+  }
+}
+
+// Case 3: NEVER policy always returns select-all RowSelections (no pruning).
+TEST_F(TestParquetFileReaderPagePruning, NeverPolicyReturnsAll) {
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(two_rg_buf_);
+  auto reader = ParquetFileReader::Open(in_file);
+
+  ArrowReaderProperties arrow_props;
+  arrow_props.set_page_index_policy(PageIndexPolicy::NEVER);
+  reader->set_arrow_reader_properties(arrow_props);
+
+  // With NEVER policy, ComputePageSelection must return select-all regardless.
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{50}));
+
+  ASSERT_EQ(2, static_cast<int>(sel_map.size()));
+  for (const auto& [rg_idx, sel] : sel_map) {
+    int64_t num_rows = reader->metadata()->RowGroup(rg_idx)->num_rows();
+    // row_count must equal total rows in that RG.
+    EXPECT_EQ(num_rows, sel->row_count());
+    // All rows must be selected (no skip selectors).
+    EXPECT_EQ(num_rows, SelectedRowCount(*sel));
+  }
+}
+
+// Case 4: ALWAYS policy with page index present prunes at least one page.
+TEST_F(TestParquetFileReaderPagePruning, AlwaysPolicyPrunes) {
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(two_rg_buf_);
+  auto reader = ParquetFileReader::Open(in_file);
+
+  ArrowReaderProperties arrow_props;
+  arrow_props.set_page_index_policy(PageIndexPolicy::ALWAYS);
+  reader->set_arrow_reader_properties(arrow_props);
+
+  // Predicate: value > 50. File has page index, so ALWAYS should work.
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{50}));
+
+  ASSERT_EQ(2, static_cast<int>(sel_map.size()));
+
+  // At least RG 0 should have some pages pruned (all values 1–50, none > 50).
+  const auto& rg0_sel = *sel_map.at(0);
+  EXPECT_EQ(50, rg0_sel.row_count());
+  // The whole RG 0 should be skippable.
+  EXPECT_EQ(0, SelectedRowCount(rg0_sel));
+}
+
+// Case 5: Missing ColumnIndex (file written without page index) with AUTO policy
+// falls back to select-all without error.
+TEST_F(TestParquetFileReaderPagePruning, MissingIndexFallback) {
+  // Build a file without page index.
+  std::vector<int32_t> vals = {1, 2, 3, 4, 5};
+  auto buf = MakeInt32ParquetFile(vals, /*page_size=*/64, /*write_page_index=*/false);
+
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(buf);
+  auto reader = ParquetFileReader::Open(in_file);
+
+  ArrowReaderProperties arrow_props;
+  arrow_props.set_page_index_policy(PageIndexPolicy::AUTO);
+  reader->set_arrow_reader_properties(arrow_props);
+
+  // Should succeed and return select-all (no error, no crash).
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{3}));
+
+  ASSERT_EQ(1, static_cast<int>(sel_map.size()));
+  // Select-all: every row must be selected.
+  const auto& sel = *sel_map.at(0);
+  EXPECT_EQ(static_cast<int64_t>(vals.size()), sel.row_count());
+  EXPECT_EQ(static_cast<int64_t>(vals.size()), SelectedRowCount(sel));
+}
+
+// Case 6: Empty row group (zero rows) is handled gracefully — 0 rows, no error.
+TEST_F(TestParquetFileReaderPagePruning, EmptyRowGroup) {
+  auto buf = MakeInt32ParquetFile({}, /*page_size=*/64, /*write_page_index=*/true);
+
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(buf);
+  auto reader = ParquetFileReader::Open(in_file);
+
+  ArrowReaderProperties arrow_props;
+  arrow_props.set_page_index_policy(PageIndexPolicy::AUTO);
+  reader->set_arrow_reader_properties(arrow_props);
+
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{0}));
+
+  ASSERT_EQ(1, static_cast<int>(sel_map.size()));
+  const auto& sel = *sel_map.at(0);
+  EXPECT_EQ(0, sel.row_count());
+  EXPECT_EQ(0, SelectedRowCount(sel));
+}
+
+// Case 7: All-null column — a non-null predicate should skip the whole chunk.
+TEST_F(TestParquetFileReaderPagePruning, AllNullColumn) {
+  constexpr int64_t kNumRows = 20;
+  auto buf = MakeAllNullInt32File(kNumRows, /*page_size=*/64, /*write_page_index=*/true);
+
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(buf);
+  auto reader = ParquetFileReader::Open(in_file);
+
+  ArrowReaderProperties arrow_props;
+  arrow_props.set_page_index_policy(PageIndexPolicy::AUTO);
+  reader->set_arrow_reader_properties(arrow_props);
+
+  // "gt 0" can never match a null value, so we expect the whole RG to be skipped.
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{0}));
+
+  ASSERT_EQ(1, static_cast<int>(sel_map.size()));
+  const auto& sel = *sel_map.at(0);
+  EXPECT_EQ(kNumRows, sel.row_count());
+  // All rows should be skipped (null pages cannot satisfy a non-null predicate).
+  EXPECT_EQ(0, SelectedRowCount(sel));
+}
+
+// Case 8: Zero-row RowSelection passed to GetRecordReader immediately returns EOS.
+TEST_F(TestParquetFileReaderPagePruning, ZeroRowSelection) {
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(two_rg_buf_);
+  auto reader = ParquetFileReader::Open(in_file);
+
+  // Construct a RowSelection covering all 50 rows in RG 0 but skipping them all.
+  auto zero_sel = std::make_shared<RowSelection>(RowSelection::None(50));
+
+  ASSERT_OK_AND_ASSIGN(auto rr, reader->GetRecordReader(0, 0, zero_sel));
+  ASSERT_NE(rr, nullptr);
+
+  // Reading should yield 0 records since everything is skipped.
+  int64_t records_read = rr->ReadRecords(1000);
+  EXPECT_EQ(0, records_read);
+  EXPECT_EQ(0, rr->values_written());
+}
+
+// Case 9: Calling ComputePageSelection with nullptr row_group_indices (empty/all)
+// returns a select-or-pruned entry for every row group without error.
+TEST_F(TestParquetFileReaderPagePruning, EmptyColumnList) {
+  // "Empty column list" in the spec maps to passing nullptr for row_group_indices,
+  // which means "all row groups".  Verify the returned map covers all RGs.
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(two_rg_buf_);
+  auto reader = ParquetFileReader::Open(in_file);
+
+  ArrowReaderProperties arrow_props;
+  arrow_props.set_page_index_policy(PageIndexPolicy::AUTO);
+  reader->set_arrow_reader_properties(arrow_props);
+
+  // Pass nullptr for row_group_indices — should process all row groups.
+  ASSERT_OK_AND_ASSIGN(
+      auto sel_map,
+      reader->ComputePageSelection(0, PredicateOp::GT, int32_t{0}, /*row_group_indices=*/nullptr));
+
+  // All 2 row groups must appear in the result map.
+  int num_rgs = reader->metadata()->num_row_groups();
+  EXPECT_EQ(num_rgs, static_cast<int>(sel_map.size()));
+
+  for (int rg_idx = 0; rg_idx < num_rgs; ++rg_idx) {
+    ASSERT_TRUE(sel_map.count(rg_idx) > 0)
+        << "Expected row group " << rg_idx << " in result map";
+    const auto& sel = *sel_map.at(rg_idx);
+    int64_t num_rows = reader->metadata()->RowGroup(rg_idx)->num_rows();
+    EXPECT_EQ(num_rows, sel.row_count());
+  }
 }
 
 }  // namespace parquet

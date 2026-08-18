@@ -281,6 +281,23 @@ class PARQUET_EXPORT FileReader {
   virtual ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadRowGroups(
       const std::vector<int>& row_groups) = 0;
 
+  /// \brief Read a row group with page-level I/O pruning via RowSelection.
+  ///
+  /// When a RowSelection is provided, only pages matching the selection are read
+  /// from disk via SparseInputStream, enabling efficient predicate pushdown with
+  /// minimal I/O overhead.
+  ///
+  /// If RowSelection is nullptr, all pages and rows are read (equivalent to
+  /// ReadRowGroup).
+  ///
+  /// \note API EXPERIMENTAL
+  virtual ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadRowGroupWithRowSelection(
+      int row_group_index, const std::vector<int>& column_indices,
+      const std::shared_ptr<::parquet::RowSelection>& row_selection) {
+    return ::arrow::Status::NotImplemented(
+        "ReadRowGroupWithRowSelection is not implemented by this FileReader");
+  }
+
   /// \deprecated Deprecated in 24.0.0. Use arrow::Result version instead.
   ARROW_DEPRECATED("Deprecated in 24.0.0. Use arrow::Result version instead.")
   ::arrow::Status ReadRowGroup(int i, const std::vector<int>& column_indices,

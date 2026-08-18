@@ -18,9 +18,12 @@
 #include "parquet/file_reader.h"
 
 #include <algorithm>
+#include <any>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <numeric>
 #include <ostream>
 #include <string>
 #include <unordered_map>
@@ -48,6 +51,7 @@
 #include "parquet/page_index.h"
 #include "parquet/platform.h"
 #include "parquet/properties.h"
+#include "parquet/row_selection.h"
 #include "parquet/schema.h"
 #include "parquet/types.h"
 
@@ -164,6 +168,27 @@ std::unique_ptr<PageReader> RowGroupReader::GetColumnPageReader(int i) {
     throw ParquetException(ss.str());
   }
   return contents_->GetColumnPageReader(i);
+}
+
+std::unique_ptr<PageReader> RowGroupReader::GetColumnPageReaderWithRowSelection(
+    int i, const RowSelection* row_selection, const OffsetIndex* offset_index,
+    int64_t row_group_row_count) {
+  if (i >= metadata()->num_columns()) {
+    std::stringstream ss;
+    ss << "Trying to read column index " << i << " but row group metadata has only "
+       << metadata()->num_columns() << " columns";
+    throw ParquetException(ss.str());
+  }
+  return contents_->GetColumnPageReaderWithRowSelection(i, row_selection, offset_index,
+                                                        row_group_row_count);
+}
+
+// Default implementation of Contents::GetColumnPageReaderWithRowSelection:
+// falls back to the plain sequential path when either pointer is null.
+std::unique_ptr<PageReader> RowGroupReader::Contents::GetColumnPageReaderWithRowSelection(
+    int i, const RowSelection* row_selection, const OffsetIndex* offset_index,
+    int64_t /*row_group_row_count*/) {
+  return GetColumnPageReader(i);
 }
 
 // Returns the rowgroup metadata
@@ -288,6 +313,65 @@ class SerializedRowGroup : public RowGroupReader::Contents {
                       std::move(data_decryptor_factory)};
     return PageReader::Open(stream, col->num_values(), col->compression(), properties_,
                             *descr, always_compressed, &ctx);
+  }
+
+  std::unique_ptr<PageReader> GetColumnPageReaderWithRowSelection(
+      int i, const RowSelection* row_selection, const OffsetIndex* offset_index,
+      int64_t row_group_row_count) override {
+    // If no RowSelection or no OffsetIndex is provided, fall back to the
+    // sequential (full column chunk) read path.
+    if (row_selection == nullptr || offset_index == nullptr) {
+      return GetColumnPageReader(i);
+    }
+
+    auto col = row_group_metadata_->ColumnChunk(i);
+    const ColumnDescriptor* descr = row_group_metadata_->schema()->Column(i);
+
+    // Page-level pruning is not supported for encrypted columns.  The page AAD
+    // used for decryption is derived from the sequential page ordinal, but
+    // sparse (non-contiguous) page delivery would feed SerializedPageReader
+    // ordinals that no longer match the ordinals the writer used, causing
+    // decryption to fail.  Reject explicitly rather than silently misbehave.
+    if (col->crypto_metadata()) {
+      throw ParquetException(
+          "Page-level I/O pruning (RowSelection) is not supported for encrypted "
+          "columns");
+    }
+
+    // Compute the sparse data-page ranges from the RowSelection + OffsetIndex.
+    std::vector<::arrow::io::ReadRange> sparse_ranges =
+        row_selection->ScanRanges(*offset_index, row_group_row_count);
+
+    // If the column chunk has a dictionary page, it precedes the first data
+    // page and must always be read.  Prepend its byte range so that
+    // SparseInputStream exposes the dictionary to SerializedPageReader.
+    if (col->has_dictionary_page() && col->dictionary_page_offset() > 0) {
+      const auto& page_locs = offset_index->page_locations();
+      if (!page_locs.empty()) {
+        // The dictionary page occupies the bytes from dictionary_page_offset
+        // up to the offset of the first data page.
+        int64_t dict_offset = col->dictionary_page_offset();
+        int64_t first_data_offset = page_locs[0].offset;
+        if (dict_offset < first_data_offset) {
+          ::arrow::io::ReadRange dict_range{dict_offset, first_data_offset - dict_offset};
+          // Prepend: if sparse_ranges already starts at or after dict_range.offset
+          // (they are data-page ranges so they will be >= first_data_offset),
+          // simply insert at the front.
+          sparse_ranges.insert(sparse_ranges.begin(), dict_range);
+        }
+      }
+    }
+
+    // Build the SparseInputStream over the underlying source.
+    auto sparse_stream =
+        std::make_shared<SparseInputStream>(source_, std::move(sparse_ranges));
+
+    bool always_compressed = file_metadata_->writer_version().VersionLt(
+        ApplicationVersion::PARQUET_CPP_10353_FIXED_VERSION());
+
+    // Encrypted columns are rejected above, so this is always the plain path.
+    return PageReader::Open(sparse_stream, col->num_values(), col->compression(),
+                            properties_, *descr, always_compressed);
   }
 
  private:
@@ -925,6 +1009,128 @@ Future<> ParquetFileReader::WhenBuffered(const std::vector<int>& row_groups,
   SerializedFile* file =
       ::arrow::internal::checked_cast<SerializedFile*>(contents_.get());
   return file->WhenBuffered(row_groups, column_indices);
+}
+
+// ----------------------------------------------------------------------
+// ArrowReaderProperties accessors
+
+void ParquetFileReader::set_arrow_reader_properties(
+    const ArrowReaderProperties& properties) {
+  arrow_reader_properties_ = properties;
+}
+
+const ArrowReaderProperties& ParquetFileReader::arrow_reader_properties() const {
+  return arrow_reader_properties_;
+}
+
+// ----------------------------------------------------------------------
+// ComputePageSelection
+
+::arrow::Result<std::map<int, std::shared_ptr<RowSelection>>>
+ParquetFileReader::ComputePageSelection(int column_index, PredicateOp op,
+                                        const std::any& predicate_value,
+                                        const std::vector<int>* row_group_indices) const {
+  // Validate column_index.
+  const int num_columns = metadata()->num_columns();
+  if (column_index < 0 || column_index >= num_columns) {
+    return ::arrow::Status::IndexError("Column index ", column_index,
+                                       " is out of range (file has ", num_columns,
+                                       " columns).");
+  }
+
+  const PageIndexPolicy policy = arrow_reader_properties_.page_index_policy();
+
+  // Build the list of row groups to process.
+  const int num_row_groups = metadata()->num_row_groups();
+  std::vector<int> rg_list;
+  if (row_group_indices == nullptr || row_group_indices->empty()) {
+    rg_list.resize(static_cast<size_t>(num_row_groups));
+    std::iota(rg_list.begin(), rg_list.end(), 0);
+  } else {
+    rg_list = *row_group_indices;
+  }
+
+  // If NEVER policy, return select-all for every row group immediately.
+  if (policy == PageIndexPolicy::NEVER) {
+    std::map<int, std::shared_ptr<RowSelection>> result;
+    for (int rg_idx : rg_list) {
+      int64_t row_count = metadata()->RowGroup(rg_idx)->num_rows();
+      result[rg_idx] = std::make_shared<RowSelection>(RowSelection::All(row_count));
+    }
+    return result;
+  }
+
+  // For AUTO or ALWAYS, get the PageIndexReader.
+  std::shared_ptr<PageIndexReader> pi_reader =
+      const_cast<ParquetFileReader*>(this)->GetPageIndexReader();
+
+  std::map<int, std::shared_ptr<RowSelection>> result;
+
+  for (int rg_idx : rg_list) {
+    int64_t row_count = metadata()->RowGroup(rg_idx)->num_rows();
+
+    // Attempt to load ColumnIndex and OffsetIndex.
+    std::shared_ptr<ColumnIndex> col_index;
+    std::shared_ptr<OffsetIndex> off_index;
+
+    if (pi_reader != nullptr) {
+      std::shared_ptr<RowGroupPageIndexReader> rg_pi_reader = pi_reader->RowGroup(rg_idx);
+      if (rg_pi_reader != nullptr) {
+        col_index = rg_pi_reader->GetColumnIndex(column_index);
+        off_index = rg_pi_reader->GetOffsetIndex(column_index);
+      }
+    }
+
+    const bool indices_present = (col_index != nullptr && off_index != nullptr);
+
+    if (!indices_present) {
+      if (policy == PageIndexPolicy::ALWAYS) {
+        return ::arrow::Status::Invalid(
+            "PageIndexPolicy is ALWAYS but page index (ColumnIndex/OffsetIndex) "
+            "is absent for row group ",
+            rg_idx, ", column ", column_index, ".");
+      }
+      // AUTO: fall back to select-all.
+      result[rg_idx] = std::make_shared<RowSelection>(RowSelection::All(row_count));
+      continue;
+    }
+
+    // Evaluate the predicate against the ColumnIndex.
+    ARROW_ASSIGN_OR_RAISE(
+        RowSelection selection,
+        col_index->FilterPages(predicate_value, op, *off_index, row_count));
+    result[rg_idx] = std::make_shared<RowSelection>(std::move(selection));
+  }
+
+  return result;
+}
+
+// ----------------------------------------------------------------------
+// GetRecordReader
+
+::arrow::Result<std::shared_ptr<internal::RecordReader>>
+ParquetFileReader::GetRecordReader(
+    int rg_index, int col_index,
+    const std::shared_ptr<RowSelection>& row_selection) const {
+  if (rg_index < 0 || rg_index >= metadata()->num_row_groups()) {
+    return ::arrow::Status::IndexError("Row group index ", rg_index,
+                                       " is out of range (file has ",
+                                       metadata()->num_row_groups(), " row groups).");
+  }
+  if (col_index < 0 || col_index >= metadata()->num_columns()) {
+    return ::arrow::Status::IndexError("Column index ", col_index,
+                                       " is out of range (file has ",
+                                       metadata()->num_columns(), " columns).");
+  }
+
+  auto row_group_reader = const_cast<ParquetFileReader*>(this)->RowGroup(rg_index);
+  auto record_reader = row_group_reader->RecordReader(col_index);
+
+  if (row_selection != nullptr) {
+    ARROW_RETURN_NOT_OK(record_reader->SetRowSelection(row_selection));
+  }
+
+  return record_reader;
 }
 
 // ----------------------------------------------------------------------

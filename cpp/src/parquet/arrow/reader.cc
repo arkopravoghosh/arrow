@@ -210,7 +210,9 @@ class FileReaderImpl : public FileReader {
   Status GetFieldReader(int i,
                         const std::shared_ptr<std::unordered_set<int>>& included_leaves,
                         const std::vector<int>& row_groups,
-                        std::unique_ptr<ColumnReaderImpl>* out) {
+                        std::unique_ptr<ColumnReaderImpl>* out,
+                        const std::map<int, std::shared_ptr<::parquet::RowSelection>>&
+                            row_selections = {}) {
     // Should be covered by GetRecordBatchReader checks but
     // manifest_.schema_fields is a separate variable so be extra careful.
     if (ARROW_PREDICT_FALSE(i < 0 ||
@@ -223,7 +225,15 @@ class FileReaderImpl : public FileReader {
     auto ctx = std::make_shared<ReaderContext>();
     ctx->reader = reader_.get();
     ctx->pool = pool_;
-    ctx->iterator_factory = SomeRowGroupsFactory(row_groups);
+    if (!row_selections.empty()) {
+      // Use sparse column iterator for page-level I/O pruning
+      ctx->iterator_factory = [row_groups, row_selections](int col_idx,
+                                                           ParquetFileReader* reader) {
+        return new SparsePagesColumnIterator(col_idx, reader, row_groups, row_selections);
+      };
+    } else {
+      ctx->iterator_factory = SomeRowGroupsFactory(row_groups);
+    }
     ctx->filter_leaves = true;
     ctx->included_leaves = included_leaves;
     ctx->reader_properties = &reader_properties_;
@@ -233,7 +243,9 @@ class FileReaderImpl : public FileReader {
   Status GetFieldReaders(const std::vector<int>& column_indices,
                          const std::vector<int>& row_groups,
                          std::vector<std::shared_ptr<ColumnReaderImpl>>* out,
-                         std::shared_ptr<::arrow::Schema>* out_schema) {
+                         std::shared_ptr<::arrow::Schema>* out_schema,
+                         const std::map<int, std::shared_ptr<::parquet::RowSelection>>&
+                             row_selections = {}) {
     // We only need to read schema fields which have columns indicated
     // in the indices vector
     ARROW_ASSIGN_OR_RAISE(std::vector<int> field_indices,
@@ -245,8 +257,8 @@ class FileReaderImpl : public FileReader {
     ::arrow::FieldVector out_fields(field_indices.size());
     for (size_t i = 0; i < out->size(); ++i) {
       std::unique_ptr<ColumnReaderImpl> reader;
-      RETURN_NOT_OK(
-          GetFieldReader(field_indices[i], included_leaves, row_groups, &reader));
+      RETURN_NOT_OK(GetFieldReader(field_indices[i], included_leaves, row_groups, &reader,
+                                   row_selections));
 
       out_fields[i] = reader->field();
       out->at(i) = std::move(reader);
@@ -269,15 +281,23 @@ class FileReaderImpl : public FileReader {
   }
 
   Status ReadColumn(int i, const std::vector<int>& row_groups, ColumnReader* reader,
-                    std::shared_ptr<ChunkedArray>* out) {
+                    std::shared_ptr<ChunkedArray>* out,
+                    const std::map<int, std::shared_ptr<::parquet::RowSelection>>&
+                        row_selections = {}) {
     BEGIN_PARQUET_CATCH_EXCEPTIONS
     // TODO(wesm): This calculation doesn't make much sense when we have repeated
     // schema nodes
     int64_t records_to_read = 0;
     for (auto row_group : row_groups) {
-      // Can throw exception
-      records_to_read +=
-          reader_->metadata()->RowGroup(row_group)->ColumnChunk(i)->num_values();
+      auto it = row_selections.find(row_group);
+      if (it != row_selections.end() && it->second) {
+        // Sparse read: only selected rows are in the stream
+        records_to_read += it->second->selected_row_count();
+      } else {
+        // Can throw exception
+        records_to_read +=
+            reader_->metadata()->RowGroup(row_group)->ColumnChunk(i)->num_values();
+      }
     }
 #ifdef ARROW_WITH_OPENTELEMETRY
     std::string column_name = reader_->metadata()->schema()->Column(i)->name();
@@ -317,7 +337,8 @@ class FileReaderImpl : public FileReader {
   // alive in async contexts.
   Future<std::shared_ptr<Table>> DecodeRowGroups(
       std::shared_ptr<FileReaderImpl> self, const std::vector<int>& row_groups,
-      const std::vector<int>& column_indices, ::arrow::internal::Executor* cpu_executor);
+      const std::vector<int>& column_indices, ::arrow::internal::Executor* cpu_executor,
+      std::map<int, std::shared_ptr<::parquet::RowSelection>> row_selections = {});
 
   Result<std::shared_ptr<Table>> ReadRowGroups(
       const std::vector<int>& row_groups) override {
@@ -332,6 +353,10 @@ class FileReaderImpl : public FileReader {
   Result<std::shared_ptr<Table>> ReadRowGroup(int i) override {
     return ReadRowGroup(i, Iota(reader_->metadata()->num_columns()));
   }
+
+  Result<std::shared_ptr<Table>> ReadRowGroupWithRowSelection(
+      int row_group_index, const std::vector<int>& column_indices,
+      const std::shared_ptr<::parquet::RowSelection>& row_selection) override;
 
   Result<std::unique_ptr<RecordBatchReader>> GetRecordBatchReader(
       const std::vector<int>& row_group_indices,
@@ -1370,20 +1395,23 @@ Result<std::shared_ptr<Table>> FileReaderImpl::ReadRowGroups(
 
 Future<std::shared_ptr<Table>> FileReaderImpl::DecodeRowGroups(
     std::shared_ptr<FileReaderImpl> self, const std::vector<int>& row_groups,
-    const std::vector<int>& column_indices, ::arrow::internal::Executor* cpu_executor) {
+    const std::vector<int>& column_indices, ::arrow::internal::Executor* cpu_executor,
+    std::map<int, std::shared_ptr<::parquet::RowSelection>> row_selections) {
   // `self` is used solely to keep `this` alive in an async context - but we use this
   // in a sync context too so use `this` over `self`
   std::vector<std::shared_ptr<ColumnReaderImpl>> readers;
   std::shared_ptr<::arrow::Schema> result_schema;
-  RETURN_NOT_OK(GetFieldReaders(column_indices, row_groups, &readers, &result_schema));
+  RETURN_NOT_OK(GetFieldReaders(column_indices, row_groups, &readers, &result_schema,
+                                row_selections));
   // OptionalParallelForAsync requires an executor
   if (!cpu_executor) cpu_executor = ::arrow::internal::GetCpuThreadPool();
 
-  auto read_column = [row_groups, self, this](size_t i,
-                                              std::shared_ptr<ColumnReaderImpl> reader)
+  auto read_column = [row_groups, row_selections, self, this](
+                         size_t i, std::shared_ptr<ColumnReaderImpl> reader)
       -> ::arrow::Result<std::shared_ptr<::arrow::ChunkedArray>> {
     std::shared_ptr<::arrow::ChunkedArray> column;
-    RETURN_NOT_OK(ReadColumn(static_cast<int>(i), row_groups, reader.get(), &column));
+    RETURN_NOT_OK(ReadColumn(static_cast<int>(i), row_groups, reader.get(), &column,
+                             row_selections));
     return column;
   };
   auto make_table = [result_schema, row_groups, self,
@@ -1405,6 +1433,23 @@ Future<std::shared_ptr<Table>> FileReaderImpl::DecodeRowGroups(
                                                      std::move(readers), read_column,
                                                      cpu_executor)
       .Then(std::move(make_table));
+}
+
+Result<std::shared_ptr<Table>> FileReaderImpl::ReadRowGroupWithRowSelection(
+    int row_group_index, const std::vector<int>& column_indices,
+    const std::shared_ptr<::parquet::RowSelection>& row_selection) {
+  RETURN_NOT_OK(BoundsCheck({row_group_index}, column_indices));
+
+  if (!row_selection) {
+    return ReadRowGroup(row_group_index, column_indices);
+  }
+
+  std::map<int, std::shared_ptr<::parquet::RowSelection>> row_selections{
+      {row_group_index, row_selection}};
+
+  auto fut = DecodeRowGroups(/*self=*/nullptr, {row_group_index}, column_indices,
+                             /*cpu_executor=*/nullptr, std::move(row_selections));
+  return fut.MoveResult();
 }
 
 std::shared_ptr<RowGroupReader> FileReaderImpl::RowGroup(int row_group_index) {

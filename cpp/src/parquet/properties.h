@@ -71,6 +71,23 @@ constexpr int32_t kDefaultThriftContainerSizeLimit = 1000 * 1000;
 // PARQUET-978: Minimize footer reads by reading 64 KB from the end of the file
 constexpr int64_t kDefaultFooterReadSize = 64 * 1024;
 
+/// \brief Controls whether page indices (ColumnIndex/OffsetIndex) are loaded and used
+/// during Parquet reads.
+///
+/// Page indices are optional Parquet metadata structures (introduced in
+/// Parquet format v2) that record per-page min/max statistics and byte offsets.
+/// When present they enable page-level row pruning, reducing the number of pages
+/// that need to be decoded during a filtered scan.
+enum class PageIndexPolicy {
+  /// Never load or use page indices. Scans use only row-group statistics for pruning.
+  NEVER,
+  /// Load and use page indices if present in the file.  If indices are absent,
+  /// fall back to row-group-only pruning.
+  AUTO,
+  /// Require page indices. Scans fail if indices are not present.
+  ALWAYS
+};
+
 class PARQUET_EXPORT ReaderProperties {
  public:
   explicit ReaderProperties(MemoryPool* pool = ::arrow::default_memory_pool())
@@ -1157,7 +1174,10 @@ class PARQUET_EXPORT ArrowReaderProperties {
         list_type_(kArrowDefaultListType),
         arrow_extensions_enabled_(false),
         should_load_statistics_(false),
-        smallest_decimal_enabled_(false) {}
+        smallest_decimal_enabled_(false),
+        page_index_policy_(PageIndexPolicy::AUTO),
+        enable_column_index_(true),
+        enable_offset_index_(true) {}
 
   /// \brief Set whether to use the IO thread pool to parse columns in parallel.
   ///
@@ -1295,6 +1315,45 @@ class PARQUET_EXPORT ArrowReaderProperties {
   /// this setting will be ignored.
   bool smallest_decimal_enabled() const { return smallest_decimal_enabled_; }
 
+  /// \brief Return the page index policy controlling whether ColumnIndex/OffsetIndex
+  /// are loaded and used during reads.
+  ///
+  /// Default is PageIndexPolicy::AUTO.
+  PageIndexPolicy page_index_policy() const { return page_index_policy_; }
+  /// \brief Set the page index policy.
+  void set_page_index_policy(PageIndexPolicy policy) { page_index_policy_ = policy; }
+
+  /// \brief Return whether ColumnIndex loading is enabled.
+  ///
+  /// ColumnIndex stores per-page min/max statistics and is required for
+  /// page-level predicate evaluation.  Both ColumnIndex and OffsetIndex are
+  /// typically useful and enabled by default.  Disabling them saves I/O for
+  /// index metadata but prevents page-level pruning.
+  ///
+  /// Default is true.
+  bool enable_column_index() const { return enable_column_index_; }
+  /// \brief Set whether to load and use ColumnIndex during reads.
+  ///
+  /// Both ColumnIndex and OffsetIndex are needed together for page pruning.
+  /// Disabling either one prevents page-level I/O reduction.
+  void set_enable_column_index(bool enable) { enable_column_index_ = enable; }
+
+  /// \brief Return whether OffsetIndex loading is enabled.
+  ///
+  /// OffsetIndex stores per-page byte offsets and row counts and is required
+  /// for mapping a RowSelection to the sparse byte ranges that SparseInputStream
+  /// will read.  Both ColumnIndex and OffsetIndex are typically useful and
+  /// enabled by default.  Disabling them saves I/O for index metadata but
+  /// prevents page-level pruning.
+  ///
+  /// Default is true.
+  bool enable_offset_index() const { return enable_offset_index_; }
+  /// \brief Set whether to load and use OffsetIndex during reads.
+  ///
+  /// Both ColumnIndex and OffsetIndex are needed together for page pruning.
+  /// Disabling either one prevents page-level I/O reduction.
+  void set_enable_offset_index(bool enable) { enable_offset_index_ = enable; }
+
  private:
   bool use_threads_;
   std::unordered_set<int> read_dict_indices_;
@@ -1308,11 +1367,56 @@ class PARQUET_EXPORT ArrowReaderProperties {
   bool arrow_extensions_enabled_;
   bool should_load_statistics_;
   bool smallest_decimal_enabled_;
+  PageIndexPolicy page_index_policy_;
+  bool enable_column_index_;
+  bool enable_offset_index_;
 };
 
 /// EXPERIMENTAL: Constructs the default ArrowReaderProperties
 PARQUET_EXPORT
 ArrowReaderProperties default_arrow_reader_properties();
+
+/// \brief Builder for ArrowReaderProperties.
+///
+/// Provides a fluent interface for constructing ArrowReaderProperties with
+/// page index policy settings.
+class PARQUET_EXPORT ArrowReaderPropertiesBuilder {
+ public:
+  explicit ArrowReaderPropertiesBuilder(
+      ArrowReaderProperties properties = ArrowReaderProperties())
+      : properties_(std::move(properties)) {}
+
+  /// \brief Set the page index policy.
+  ///
+  /// Controls whether ColumnIndex/OffsetIndex are loaded and used during reads.
+  /// Default is PageIndexPolicy::AUTO.
+  ArrowReaderPropertiesBuilder& set_page_index_policy(PageIndexPolicy policy) {
+    properties_.set_page_index_policy(policy);
+    return *this;
+  }
+
+  /// \brief Set whether to load and use ColumnIndex during reads.
+  ///
+  /// Default is true.
+  ArrowReaderPropertiesBuilder& enable_column_index(bool enable) {
+    properties_.set_enable_column_index(enable);
+    return *this;
+  }
+
+  /// \brief Set whether to load and use OffsetIndex during reads.
+  ///
+  /// Default is true.
+  ArrowReaderPropertiesBuilder& enable_offset_index(bool enable) {
+    properties_.set_enable_offset_index(enable);
+    return *this;
+  }
+
+  /// \brief Build and return the configured ArrowReaderProperties.
+  ArrowReaderProperties build() { return properties_; }
+
+ private:
+  ArrowReaderProperties properties_;
+};
 
 class PARQUET_EXPORT ArrowWriterProperties {
  public:

@@ -35,7 +35,10 @@
 #include "arrow/array/builder_binary.h"
 #include "arrow/array/builder_dict.h"
 #include "arrow/array/builder_primitive.h"
+#include "arrow/buffer.h"
 #include "arrow/chunked_array.h"
+#include "arrow/io/interfaces.h"
+#include "arrow/io/memory.h"
 #include "arrow/type.h"
 #include "arrow/util/bit_stream_utils_internal.h"
 #include "arrow/util/bit_util.h"
@@ -225,6 +228,142 @@ auto LevelDecoder::CountUpTo(int16_t value, int batch_size) -> CountUpToResult {
 ReaderProperties default_reader_properties() {
   static ReaderProperties default_reader_properties;
   return default_reader_properties;
+}
+
+// ----------------------------------------------------------------------
+// SparseInputStream
+
+SparseInputStream::SparseInputStream(
+    std::shared_ptr<::arrow::io::RandomAccessFile> source,
+    std::vector<::arrow::io::ReadRange> read_ranges)
+    : source_(std::move(source)),
+      read_ranges_(std::move(read_ranges)),
+      current_range_index_(0),
+      position_in_range_(0),
+      logical_position_(0),
+      total_size_(0),
+      peek_buffer_(nullptr) {
+  // Validate: ranges must be sorted, non-overlapping, and non-negative.
+  for (size_t i = 0; i < read_ranges_.size(); ++i) {
+    const auto& r = read_ranges_[i];
+    if (r.offset < 0 || r.length < 0) {
+      throw ParquetException("SparseInputStream: range offset and length must be >= 0");
+    }
+    if (i > 0) {
+      const auto& prev = read_ranges_[i - 1];
+      if (r.offset < prev.offset + prev.length) {
+        throw ParquetException(
+            "SparseInputStream: read_ranges must be sorted and non-overlapping");
+      }
+    }
+    total_size_ += r.length;
+  }
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Buffer>> SparseInputStream::Read(
+    int64_t nbytes) {
+  if (nbytes < 0) {
+    return ::arrow::Status::Invalid("SparseInputStream::Read: nbytes must be >= 0");
+  }
+
+  // At logical EOF or empty request.
+  if (current_range_index_ >= read_ranges_.size() || nbytes == 0) {
+    return std::make_shared<::arrow::Buffer>(nullptr, 0);
+  }
+
+  const auto& range = read_ranges_[current_range_index_];
+  int64_t bytes_remaining_in_range = range.length - position_in_range_;
+  int64_t bytes_to_read = std::min(nbytes, bytes_remaining_in_range);
+
+  int64_t abs_offset = range.offset + position_in_range_;
+  ARROW_ASSIGN_OR_RAISE(auto buffer, source_->ReadAt(abs_offset, bytes_to_read));
+
+  int64_t bytes_read = buffer->size();
+  position_in_range_ += bytes_read;
+  logical_position_ += bytes_read;
+
+  // If we've consumed this range entirely, advance to the next one.
+  if (position_in_range_ >= range.length) {
+    ++current_range_index_;
+    position_in_range_ = 0;
+  }
+
+  return buffer;
+}
+
+::arrow::Result<int64_t> SparseInputStream::Read(int64_t nbytes, void* out) {
+  ARROW_ASSIGN_OR_RAISE(auto buffer, Read(nbytes));
+  if (buffer->size() > 0) {
+    std::memcpy(out, buffer->data(), buffer->size());
+  }
+  return buffer->size();
+}
+
+::arrow::Status SparseInputStream::Seek(int64_t position) {
+  if (position < 0 || position > total_size_) {
+    return ::arrow::Status::IOError("SparseInputStream::Seek: position ", position,
+                                    " is out of bounds [0, ", total_size_, "]");
+  }
+
+  // Walk through read_ranges accumulating sizes to find which range
+  // contains this logical position.
+  int64_t accumulated = 0;
+  for (size_t i = 0; i < read_ranges_.size(); ++i) {
+    int64_t range_end = accumulated + read_ranges_[i].length;
+    if (position < range_end) {
+      // Position falls strictly inside range i.
+      current_range_index_ = i;
+      position_in_range_ = position - accumulated;
+      logical_position_ = position;
+      return ::arrow::Status::OK();
+    }
+    if (position == range_end) {
+      // Position is exactly at the end of range i.  Place the cursor at the
+      // beginning of the next range (or at logical EOF if there is no next).
+      current_range_index_ = i + 1;
+      position_in_range_ = 0;
+      logical_position_ = position;
+      return ::arrow::Status::OK();
+    }
+    accumulated = range_end;
+  }
+
+  // position == total_size_ (logical EOF).
+  current_range_index_ = read_ranges_.size();
+  position_in_range_ = 0;
+  logical_position_ = total_size_;
+  return ::arrow::Status::OK();
+}
+
+::arrow::Result<int64_t> SparseInputStream::Tell() const { return logical_position_; }
+
+::arrow::Result<int64_t> SparseInputStream::GetSize() { return total_size_; }
+
+::arrow::Status SparseInputStream::Close() { return source_->Close(); }
+
+bool SparseInputStream::closed() const { return source_->closed(); }
+
+::arrow::Result<std::string_view> SparseInputStream::Peek(int64_t nbytes) {
+  if (nbytes < 0) {
+    return ::arrow::Status::Invalid("SparseInputStream::Peek: nbytes must be >= 0");
+  }
+
+  // At logical EOF: return an empty view.
+  if (current_range_index_ >= read_ranges_.size() || nbytes == 0) {
+    return std::string_view("", 0);
+  }
+
+  // Clamp to the bytes remaining in the current range (Peek does not cross range
+  // boundaries to avoid materialising data from a range that may not be needed).
+  const auto& range = read_ranges_[current_range_index_];
+  int64_t bytes_remaining = range.length - position_in_range_;
+  int64_t bytes_to_peek = std::min(nbytes, bytes_remaining);
+
+  int64_t abs_offset = range.offset + position_in_range_;
+  ARROW_ASSIGN_OR_RAISE(peek_buffer_, source_->ReadAt(abs_offset, bytes_to_peek));
+
+  return std::string_view(reinterpret_cast<const char*>(peek_buffer_->data()),
+                          static_cast<size_t>(peek_buffer_->size()));
 }
 
 namespace {
@@ -1382,6 +1521,59 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
 
   int64_t ReadRecords(int64_t num_records) override {
     if (num_records == 0) return 0;
+
+    // If a RowSelection is active, dispatch through it: for each selector
+    // that falls within the requested record range, either skip (skip=true)
+    // or read (skip=false) the corresponding rows.
+    if (row_selection_ != nullptr) {
+      int64_t records_read = 0;
+      const int64_t num_selectors = static_cast<int64_t>(row_selection_->page_count());
+
+      while (records_read < num_records &&
+             current_selector_index_ < static_cast<size_t>(num_selectors)) {
+        const RowSelector& sel = row_selection_->selector(current_selector_index_);
+        // Remaining rows in the current selector that have not been consumed yet.
+        int64_t rows_remaining_in_selector = sel.row_count - rows_consumed_in_selector_;
+
+        if (sel.skip) {
+          // Skip over this selector's remaining rows (or as many as needed).
+          int64_t to_skip = rows_remaining_in_selector;
+          int64_t actually_skipped = SkipRecordsSequential(to_skip);
+          rows_consumed_in_selector_ += actually_skipped;
+          if (rows_consumed_in_selector_ >= sel.row_count) {
+            ++current_selector_index_;
+            rows_consumed_in_selector_ = 0;
+          }
+          // Skipped rows don't count toward records_read; continue to next
+          // selector.
+        } else {
+          // Read rows from this selector (up to what the caller requested).
+          int64_t to_read =
+              std::min(rows_remaining_in_selector, num_records - records_read);
+          int64_t actually_read = ReadRecordsSequential(to_read);
+          records_read += actually_read;
+          rows_consumed_in_selector_ += actually_read;
+          if (rows_consumed_in_selector_ >= sel.row_count) {
+            ++current_selector_index_;
+            rows_consumed_in_selector_ = 0;
+          }
+          // If we got fewer records than requested from the underlying reader,
+          // it means the column chunk is exhausted — stop.
+          if (actually_read < to_read) {
+            break;
+          }
+        }
+      }
+      return records_read;
+    }
+
+    // No RowSelection — fall through to the sequential path.
+    return ReadRecordsSequential(num_records);
+  }
+
+  // Sequential (no RowSelection) implementation of ReadRecords.
+  int64_t ReadRecordsSequential(int64_t num_records) {
+    if (num_records == 0) return 0;
     // Delimit records, then read values at the end
     int64_t records_read = 0;
 
@@ -1621,6 +1813,53 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
   int64_t SkipRecords(int64_t num_records) override {
     if (num_records == 0) return 0;
 
+    // If a RowSelection is active, dispatch through it.
+    if (row_selection_ != nullptr) {
+      int64_t records_skipped = 0;
+      const int64_t num_selectors = static_cast<int64_t>(row_selection_->page_count());
+
+      while (records_skipped < num_records &&
+             current_selector_index_ < static_cast<size_t>(num_selectors)) {
+        const RowSelector& sel = row_selection_->selector(current_selector_index_);
+        int64_t rows_remaining_in_selector = sel.row_count - rows_consumed_in_selector_;
+
+        if (sel.skip) {
+          // The caller wants to skip; so does the selector — skip them all.
+          int64_t to_skip = rows_remaining_in_selector;
+          int64_t actually_skipped = SkipRecordsSequential(to_skip);
+          rows_consumed_in_selector_ += actually_skipped;
+          if (rows_consumed_in_selector_ >= sel.row_count) {
+            ++current_selector_index_;
+            rows_consumed_in_selector_ = 0;
+          }
+          // Rows in a skip selector don't count toward the caller's skip budget.
+        } else {
+          // The caller wants to skip over selected rows.
+          int64_t to_skip =
+              std::min(rows_remaining_in_selector, num_records - records_skipped);
+          int64_t actually_skipped = SkipRecordsSequential(to_skip);
+          records_skipped += actually_skipped;
+          rows_consumed_in_selector_ += actually_skipped;
+          if (rows_consumed_in_selector_ >= sel.row_count) {
+            ++current_selector_index_;
+            rows_consumed_in_selector_ = 0;
+          }
+          if (actually_skipped < to_skip) {
+            break;
+          }
+        }
+      }
+      return records_skipped;
+    }
+
+    // No RowSelection — fall through to the sequential path.
+    return SkipRecordsSequential(num_records);
+  }
+
+  // Sequential (no RowSelection) implementation of SkipRecords.
+  int64_t SkipRecordsSequential(int64_t num_records) {
+    if (num_records == 0) return 0;
+
     // Top level required field. Number of records equals to number of levels,
     // and there is not read-ahead for levels.
     if (this->max_rep_level() == 0 && this->max_def_level() == 0) {
@@ -1823,6 +2062,15 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     this->pager_ = std::move(reader);
     ResetDecoders();
   }
+
+  ::arrow::Status SetRowSelection(std::shared_ptr<RowSelection> row_selection) override {
+    row_selection_ = std::move(row_selection);
+    current_selector_index_ = 0;
+    rows_consumed_in_selector_ = 0;
+    return ::arrow::Status::OK();
+  }
+
+  std::shared_ptr<RowSelection> row_selection() const override { return row_selection_; }
 
   bool HasMoreData() const override { return this->pager_ != nullptr; }
 
@@ -2038,6 +2286,13 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     return values_->mutable_data_as<T>() + values_written_;
   }
   LevelInfo leaf_info_;
+
+  // RowSelection: optional filter controlling which row ranges are read/skipped.
+  std::shared_ptr<RowSelection> row_selection_;
+  // Index of the current RowSelector being processed.
+  size_t current_selector_index_ = 0;
+  // How many rows within the current selector have already been consumed.
+  int64_t rows_consumed_in_selector_ = 0;
 };
 
 /// In FLBARecordReader, we read fixed length byte array values.

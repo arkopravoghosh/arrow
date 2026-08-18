@@ -17,21 +17,26 @@
 
 #pragma once
 
+#include <any>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "arrow/io/caching.h"
+#include "arrow/result.h"
 #include "arrow/util/type_fwd.h"
 #include "parquet/metadata.h"  // IWYU pragma: keep
 #include "parquet/platform.h"
 #include "parquet/properties.h"
+#include "parquet/row_selection.h"
 
 namespace parquet {
 
 class ColumnReader;
 class FileMetaData;
+class OffsetIndex;
 class PageIndexReader;
 class BloomFilterReader;
 class PageReader;
@@ -49,6 +54,18 @@ class PARQUET_EXPORT RowGroupReader {
   struct Contents {
     virtual ~Contents() {}
     virtual std::unique_ptr<PageReader> GetColumnPageReader(int i) = 0;
+
+    // \brief Variant of GetColumnPageReader that wraps the column stream in a
+    // SparseInputStream when a RowSelection and OffsetIndex are provided.
+    //
+    // If row_selection is nullptr or offset_index is nullptr the method falls
+    // back to the plain sequential read path (identical to GetColumnPageReader).
+    //
+    // \note API EXPERIMENTAL
+    virtual std::unique_ptr<PageReader> GetColumnPageReaderWithRowSelection(
+        int i, const RowSelection* row_selection, const OffsetIndex* offset_index,
+        int64_t row_group_row_count);
+
     virtual const RowGroupMetaData* metadata() const = 0;
     virtual const ReaderProperties* properties() const = 0;
   };
@@ -94,6 +111,20 @@ class PARQUET_EXPORT RowGroupReader {
       int i, ExposedEncoding encoding_to_expose);
 
   std::unique_ptr<PageReader> GetColumnPageReader(int i);
+
+  // \brief Obtain a PageReader for column i, restricting I/O to the pages
+  // needed for the given RowSelection (when row_selection and offset_index are
+  // non-null).
+  //
+  // When both row_selection and offset_index are provided, the underlying
+  // column stream is wrapped in a SparseInputStream so that only the byte
+  // ranges required for selected rows are read.  Falls back to the plain
+  // sequential read path when either pointer is null.
+  //
+  // \note API EXPERIMENTAL
+  std::unique_ptr<PageReader> GetColumnPageReaderWithRowSelection(
+      int i, const RowSelection* row_selection, const OffsetIndex* offset_index,
+      int64_t row_group_row_count);
 
  private:
   // Holds a pointer to an instance of Contents implementation
@@ -236,9 +267,91 @@ class PARQUET_EXPORT ParquetFileReader {
   ::arrow::Future<> WhenBuffered(const std::vector<int>& row_groups,
                                  const std::vector<int>& column_indices) const;
 
+  /// \brief Set the ArrowReaderProperties used by page-pruning APIs.
+  ///
+  /// Must be called before ComputePageSelection() to configure the
+  /// PageIndexPolicy.  If not called, the default ArrowReaderProperties
+  /// (PageIndexPolicy::AUTO) are used.
+  ///
+  /// \note API EXPERIMENTAL
+  void set_arrow_reader_properties(const ArrowReaderProperties& properties);
+
+  /// \brief Return the ArrowReaderProperties currently in effect.
+  ///
+  /// \note API EXPERIMENTAL
+  const ArrowReaderProperties& arrow_reader_properties() const;
+
+  /// \brief Compute a row selection for page-level filtering based on a predicate.
+  ///
+  /// Evaluates a predicate (e.g., column > 5) against the ColumnIndex statistics for
+  /// the specified physical column across the requested row groups.  Returns a map from
+  /// row-group index to RowSelection, indicating which rows in each row group might
+  /// match the predicate.
+  ///
+  /// Behavior depends on the PageIndexPolicy stored in the reader's
+  /// ArrowReaderProperties:
+  ///   - NEVER:  returns a select-all RowSelection for each row group (no pruning).
+  ///   - AUTO:   if ColumnIndex/OffsetIndex are present, evaluates the predicate;
+  ///             otherwise falls back to a select-all RowSelection.
+  ///   - ALWAYS: returns Status::Invalid if the indices are absent.
+  ///
+  /// The returned RowSelections can be passed to GetRecordReader() or directly to
+  /// RowGroupReader::GetColumnPageReaderWithRowSelection() to restrict I/O to
+  /// pages that can satisfy the predicate.
+  ///
+  /// \param column_index  Physical column index (0-based).
+  /// \param op            Predicate operator (see PredicateOp).
+  /// \param predicate_value  Scalar value to compare against (type must match
+  ///                         the column's physical type; ignored for IS_NULL /
+  ///                         IS_NOT_NULL).
+  /// \param row_group_indices  Optional list of row-group indices to filter.
+  ///                           Pass nullptr or an empty vector to use all row
+  ///                           groups.
+  /// \returns Map from row-group index to the corresponding RowSelection, or an
+  ///          error status if column_index is out of range, or the
+  ///          PageIndexPolicy is ALWAYS and indices are absent.
+  ///
+  /// \note API EXPERIMENTAL
+  ::arrow::Result<std::map<int, std::shared_ptr<RowSelection>>> ComputePageSelection(
+      int column_index, PredicateOp op, const std::any& predicate_value,
+      const std::vector<int>* row_group_indices = nullptr) const;
+
+  /// \brief Construct a RecordReader with optional row selection for page-level
+  /// filtering.
+  ///
+  /// Builds a reader for the given row group and column.  If \p row_selection is
+  /// provided (typically obtained from ComputePageSelection()), the reader will
+  /// skip/read rows according to the selection, restricting I/O to only the pages
+  /// that overlap selected row ranges.  If \p row_selection is nullptr, all rows are
+  /// read (existing behavior).
+  ///
+  /// Typical usage:
+  /// \code{.cpp}
+  ///   auto selections = reader->ComputePageSelection(col, PredicateOp::GT,
+  ///                                                  std::any(int32_t(50))).ValueOrDie();
+  ///   for (auto& [rg, sel] : selections) {
+  ///     auto record_reader = reader->GetRecordReader(rg, col, sel).ValueOrDie();
+  ///     // read batches from record_reader ...
+  ///   }
+  /// \endcode
+  ///
+  /// \param rg_index    Row-group index (0-based).
+  /// \param col_index   Physical column index (0-based) within the row group.
+  /// \param row_selection  Optional selection; nullptr means read all rows.
+  /// \returns Shared RecordReader with the selection applied (if any), or an error
+  ///          status if rg_index or col_index is out of range.
+  ///
+  /// \note API EXPERIMENTAL
+  ::arrow::Result<std::shared_ptr<internal::RecordReader>> GetRecordReader(
+      int rg_index, int col_index,
+      const std::shared_ptr<RowSelection>& row_selection = nullptr) const;
+
  private:
   // Holds a pointer to an instance of Contents implementation
   std::unique_ptr<Contents> contents_;
+
+  // ArrowReaderProperties governing page-index behaviour for ComputePageSelection.
+  ArrowReaderProperties arrow_reader_properties_;
 };
 
 // Read only Parquet file metadata

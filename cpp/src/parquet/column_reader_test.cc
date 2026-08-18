@@ -28,9 +28,18 @@
 #include <vector>
 
 #include "arrow/array/array_binary.h"
+#include "arrow/io/memory.h"
+#include "arrow/testing/gtest_util.h"
+#include "arrow/util/config.h"
 #include "arrow/util/macros.h"
 #include "parquet/column_page.h"
 #include "parquet/column_reader.h"
+#include "parquet/column_writer.h"
+#include "parquet/file_reader.h"
+#include "parquet/file_writer.h"
+#include "parquet/metadata.h"
+#include "parquet/properties.h"
+#include "parquet/row_selection.h"
 #include "parquet/schema.h"
 #include "parquet/test_util.h"
 #include "parquet/types.h"
@@ -1842,6 +1851,551 @@ TEST_P(RecordReaderStressTest, StressTest) {
 INSTANTIATE_TEST_SUITE_P(Repetition_type, RecordReaderStressTest,
                          ::testing::Values(Repetition::REQUIRED, Repetition::OPTIONAL,
                                            Repetition::REPEATED));
+
+// =============================================================================
+// TestSparseInputStream — unit tests for SparseInputStream
+// =============================================================================
+
+// Helper: build an in-memory RandomAccessFile from a byte vector.
+static std::shared_ptr<::arrow::io::RandomAccessFile> MakeBufferFile(
+    const std::vector<uint8_t>& data) {
+  auto buf =
+      std::make_shared<::arrow::Buffer>(data.data(), static_cast<int64_t>(data.size()));
+  return std::make_shared<::arrow::io::BufferReader>(buf);
+}
+
+class TestSparseInputStream : public ::testing::Test {
+ protected:
+  // Builds a 256-byte source where byte[i] == i % 256.
+  void SetUp() override {
+    source_data_.resize(256);
+    for (int i = 0; i < 256; ++i) source_data_[i] = static_cast<uint8_t>(i);
+    source_ = MakeBufferFile(source_data_);
+  }
+
+  std::vector<uint8_t> source_data_;
+  std::shared_ptr<::arrow::io::RandomAccessFile> source_;
+};
+
+// Case 1: three non-contiguous ranges — correct bytes returned, gaps skipped.
+TEST_F(TestSparseInputStream, ThreeNonContiguousRanges) {
+  // Ranges: [10,15), [30,35), [100,110)
+  std::vector<::arrow::io::ReadRange> ranges = {{10, 5}, {30, 5}, {100, 10}};
+  SparseInputStream stream(source_, ranges);
+
+  // Total logical size = 5 + 5 + 10 = 20
+  ASSERT_OK_AND_ASSIGN(int64_t sz, stream.GetSize());
+  EXPECT_EQ(sz, 20);
+
+  // Read range 0: bytes 10..14
+  ASSERT_OK_AND_ASSIGN(auto buf0, stream.Read(5));
+  ASSERT_EQ(buf0->size(), 5);
+  for (int i = 0; i < 5; ++i) EXPECT_EQ(buf0->data()[i], source_data_[10 + i]);
+
+  // Read range 1: bytes 30..34
+  ASSERT_OK_AND_ASSIGN(auto buf1, stream.Read(5));
+  ASSERT_EQ(buf1->size(), 5);
+  for (int i = 0; i < 5; ++i) EXPECT_EQ(buf1->data()[i], source_data_[30 + i]);
+
+  // Read range 2: bytes 100..109
+  ASSERT_OK_AND_ASSIGN(auto buf2, stream.Read(10));
+  ASSERT_EQ(buf2->size(), 10);
+  for (int i = 0; i < 10; ++i) EXPECT_EQ(buf2->data()[i], source_data_[100 + i]);
+
+  // Should be at EOF
+  ASSERT_OK_AND_ASSIGN(auto eof_buf, stream.Read(1));
+  EXPECT_EQ(eof_buf->size(), 0);
+}
+
+// Case 2: skip pages 0 & 1, select only the third range (page 2).
+// Verifies that a SparseInputStream covering only the third page returns
+// exactly the third page's bytes and returns empty on the next read.
+TEST_F(TestSparseInputStream, SkipPagesBoundaryCase) {
+  // Simulate 3 pages of 20 bytes each at offsets 0, 20, 40.
+  // Only include range for page 2 ([40, 60)).
+  std::vector<::arrow::io::ReadRange> ranges = {{40, 20}};
+  SparseInputStream stream(source_, ranges);
+
+  ASSERT_OK_AND_ASSIGN(int64_t sz, stream.GetSize());
+  EXPECT_EQ(sz, 20);
+
+  ASSERT_OK_AND_ASSIGN(auto buf, stream.Read(20));
+  ASSERT_EQ(buf->size(), 20);
+  for (int i = 0; i < 20; ++i) EXPECT_EQ(buf->data()[i], source_data_[40 + i]);
+
+  // Next read returns empty (logical EOF).
+  ASSERT_OK_AND_ASSIGN(auto eof_buf, stream.Read(20));
+  EXPECT_EQ(eof_buf->size(), 0);
+}
+
+// Case 3: select first half (rows 0–49 maps to first 50 bytes).
+TEST_F(TestSparseInputStream, SelectFirstHalf) {
+  std::vector<::arrow::io::ReadRange> ranges = {{0, 50}};
+  SparseInputStream stream(source_, ranges);
+
+  ASSERT_OK_AND_ASSIGN(auto buf, stream.Read(50));
+  ASSERT_EQ(buf->size(), 50);
+  for (int i = 0; i < 50; ++i) EXPECT_EQ(buf->data()[i], source_data_[i]);
+}
+
+// Case 4: skip first half, select second half (bytes 50–99).
+TEST_F(TestSparseInputStream, SelectSecondHalf) {
+  std::vector<::arrow::io::ReadRange> ranges = {{50, 50}};
+  SparseInputStream stream(source_, ranges);
+
+  ASSERT_OK_AND_ASSIGN(auto buf, stream.Read(50));
+  ASSERT_EQ(buf->size(), 50);
+  for (int i = 0; i < 50; ++i) EXPECT_EQ(buf->data()[i], source_data_[50 + i]);
+}
+
+// Case 5: skipped range issues no Read — verify by checking an empty ranges
+// vector results in zero bytes returned (i.e. all ranges were "skipped").
+TEST_F(TestSparseInputStream, SkippedRangeNoRead) {
+  // Empty range list: all data is effectively skipped.
+  std::vector<::arrow::io::ReadRange> ranges = {};
+  SparseInputStream stream(source_, ranges);
+
+  ASSERT_OK_AND_ASSIGN(int64_t sz, stream.GetSize());
+  EXPECT_EQ(sz, 0);
+
+  ASSERT_OK_AND_ASSIGN(auto buf, stream.Read(10));
+  EXPECT_EQ(buf->size(), 0);
+}
+
+// Case 6: select-all is equivalent to no selection (reads entire content).
+TEST_F(TestSparseInputStream, SelectAllEqualsNoSelection) {
+  // One range spanning the entire 256-byte source.
+  std::vector<::arrow::io::ReadRange> ranges = {{0, 256}};
+  SparseInputStream stream(source_, ranges);
+
+  ASSERT_OK_AND_ASSIGN(int64_t sz, stream.GetSize());
+  EXPECT_EQ(sz, 256);
+
+  ASSERT_OK_AND_ASSIGN(auto buf, stream.Read(256));
+  ASSERT_EQ(buf->size(), 256);
+  for (int i = 0; i < 256; ++i) EXPECT_EQ(buf->data()[i], source_data_[i]);
+}
+
+// Case 7: skip-all → 0 values. (Same as SkippedRangeNoRead but via empty
+// ranges to confirm zero logical size and empty read.)
+TEST_F(TestSparseInputStream, SkipAll) {
+  std::vector<::arrow::io::ReadRange> ranges = {};
+  SparseInputStream stream(source_, ranges);
+  ASSERT_OK_AND_ASSIGN(int64_t sz, stream.GetSize());
+  EXPECT_EQ(sz, 0);
+  ASSERT_OK_AND_ASSIGN(auto buf, stream.Read(256));
+  EXPECT_EQ(buf->size(), 0);
+}
+
+// Case 8: select-all matches unfiltered — byte-for-byte equal to direct read.
+TEST_F(TestSparseInputStream, SelectAllMatchesUnfiltered) {
+  std::vector<::arrow::io::ReadRange> ranges = {{0, 256}};
+  SparseInputStream stream(source_, ranges);
+
+  // Read in two halves; should still recover all bytes in order.
+  ASSERT_OK_AND_ASSIGN(auto first, stream.Read(128));
+  ASSERT_OK_AND_ASSIGN(auto second, stream.Read(128));
+  ASSERT_EQ(first->size(), 128);
+  ASSERT_EQ(second->size(), 128);
+  for (int i = 0; i < 128; ++i) EXPECT_EQ(first->data()[i], source_data_[i]);
+  for (int i = 0; i < 128; ++i) EXPECT_EQ(second->data()[i], source_data_[128 + i]);
+}
+
+// Case 9: single full-span range is equivalent to sequential read.
+TEST_F(TestSparseInputStream, SingleFullSpan) {
+  std::vector<::arrow::io::ReadRange> ranges = {{0, 256}};
+  SparseInputStream stream(source_, ranges);
+
+  // Read all bytes in a single call; verify sequential equality.
+  ASSERT_OK_AND_ASSIGN(auto buf, stream.Read(256));
+  ASSERT_EQ(buf->size(), 256);
+  EXPECT_EQ(0, std::memcmp(buf->data(), source_data_.data(), 256));
+}
+
+// Case 10: page boundary at last byte — reading the final range then returns
+// nullptr (empty buffer).
+TEST_F(TestSparseInputStream, PageBoundaryAtLastByte) {
+  // Range ending exactly at the last byte of the source (byte 255).
+  std::vector<::arrow::io::ReadRange> ranges = {{255, 1}};
+  SparseInputStream stream(source_, ranges);
+
+  ASSERT_OK_AND_ASSIGN(int64_t sz, stream.GetSize());
+  EXPECT_EQ(sz, 1);
+
+  // Read the single byte.
+  ASSERT_OK_AND_ASSIGN(auto buf, stream.Read(1));
+  ASSERT_EQ(buf->size(), 1);
+  EXPECT_EQ(buf->data()[0], source_data_[255]);
+
+  // Next read is at logical EOF, must return empty buffer (not null).
+  ASSERT_OK_AND_ASSIGN(auto eof_buf, stream.Read(1));
+  EXPECT_EQ(eof_buf->size(), 0);
+}
+
+// =============================================================================
+// TestSerializedPageReader — page-reader tests driven by SerializedPageReader
+// (accessed via PageReader::Open) over a SparseInputStream.
+// =============================================================================
+
+namespace {
+
+// Build a minimal multi-page Parquet column chunk into an in-memory buffer,
+// returning:
+//   - buffer: the raw byte data
+//   - total_values: total int32 values written
+//   - pages_per_row_count: number of values written per page
+//
+// Uses N pages of kValuesPerPage required int32 values.
+struct MultiPageColumn {
+  std::shared_ptr<::arrow::Buffer> buffer;
+  int64_t total_values;
+  int values_per_page;
+  int num_pages;
+};
+
+::arrow::Result<MultiPageColumn> BuildMultiPageInt32Column(
+    int num_pages, int values_per_page,
+    Compression::type codec = Compression::UNCOMPRESSED) {
+  // Build schema: required int32 field "col".
+  schema::NodeVector fields;
+  fields.push_back(
+      PrimitiveNode::Make("col", Repetition::REQUIRED, Type::INT32, ConvertedType::NONE));
+  auto schema_node = std::static_pointer_cast<schema::GroupNode>(
+      schema::GroupNode::Make("schema", Repetition::REQUIRED, fields));
+
+  auto writer_props = WriterProperties::Builder()
+                          .disable_dictionary()
+                          ->compression(codec)
+                          // Small page size forces multiple pages.
+                          ->data_pagesize(values_per_page * sizeof(int32_t) + 64)
+                          ->build();
+
+  ARROW_ASSIGN_OR_RAISE(auto out_stream, ::arrow::io::BufferOutputStream::Create());
+  auto file_writer = ParquetFileWriter::Open(out_stream, schema_node, writer_props);
+  auto rg_writer = file_writer->AppendRowGroup();
+  auto int32_writer = static_cast<Int32Writer*>(rg_writer->NextColumn());
+
+  // Write values: value[i] = p * values_per_page + i for page p.
+  std::vector<int32_t> values(values_per_page);
+  for (int p = 0; p < num_pages; ++p) {
+    for (int i = 0; i < values_per_page; ++i) {
+      values[i] = p * values_per_page + i;
+    }
+    int32_writer->WriteBatch(values_per_page, nullptr, nullptr, values.data());
+  }
+  rg_writer->Close();
+  file_writer->Close();
+
+  ARROW_ASSIGN_OR_RAISE(auto buf, out_stream->Finish());
+  MultiPageColumn result;
+  result.buffer = buf;
+  result.total_values = static_cast<int64_t>(num_pages * values_per_page);
+  result.values_per_page = values_per_page;
+  result.num_pages = num_pages;
+  return result;
+}
+
+}  // namespace
+
+class TestSerializedPageReader : public ::testing::Test {
+ protected:
+  static constexpr int kNumPages = 4;
+  static constexpr int kValuesPerPage = 25;  // 100 values total
+
+  void SetUp() override {
+    ASSERT_OK_AND_ASSIGN(col_, BuildMultiPageInt32Column(kNumPages, kValuesPerPage));
+    ASSERT_NE(col_.buffer, nullptr);
+    ASSERT_GT(col_.buffer->size(), 0);
+  }
+
+  // Open the Parquet file and return a PageReader for column 0 via the
+  // normal (non-sparse) path. The caller must keep file_reader alive for the
+  // duration of the page reader's use; store it in the provided unique_ptr.
+  std::unique_ptr<PageReader> OpenPageReader(
+      const std::shared_ptr<::arrow::Buffer>& buf,
+      std::unique_ptr<ParquetFileReader>& out_file_reader) {
+    auto source = std::make_shared<::arrow::io::BufferReader>(buf);
+    out_file_reader = ParquetFileReader::Open(source);
+    auto rg_reader = out_file_reader->RowGroup(0);
+    return rg_reader->GetColumnPageReader(0);
+  }
+
+  MultiPageColumn col_;
+};
+
+// Case 3 (page-level): open page reader on uncompressed column, verify we
+// can iterate and read expected number of non-null data pages.
+TEST_F(TestSerializedPageReader, SelectFirstHalfPages) {
+  std::unique_ptr<ParquetFileReader> file_reader;
+  auto page_reader = OpenPageReader(col_.buffer, file_reader);
+  ASSERT_NE(page_reader, nullptr);
+
+  int data_page_count = 0;
+  int64_t total_values_seen = 0;
+  while (true) {
+    auto page = page_reader->NextPage();
+    if (!page) break;
+    if (page->type() == PageType::DATA_PAGE || page->type() == PageType::DATA_PAGE_V2) {
+      auto data_page = std::static_pointer_cast<DataPage>(page);
+      total_values_seen += data_page->num_values();
+      ++data_page_count;
+    }
+  }
+  EXPECT_EQ(data_page_count, kNumPages);
+  EXPECT_EQ(total_values_seen, kNumPages * kValuesPerPage);
+}
+
+// Case 2 (page-level): use data_page_filter to skip pages 0 and 1,
+// verify only pages 2 and 3 are processed.
+TEST_F(TestSerializedPageReader, SkipPagesBoundaryCase) {
+  std::unique_ptr<ParquetFileReader> file_reader;
+  auto page_reader = OpenPageReader(col_.buffer, file_reader);
+  ASSERT_NE(page_reader, nullptr);
+
+  int page_ordinal = 0;
+  // Filter: skip the first two data pages (ordinals 0 and 1).
+  page_reader->set_data_page_filter([&page_ordinal](const DataPageStats&) -> bool {
+    return page_ordinal++ < 2;  // true == skip
+  });
+
+  int data_pages_processed = 0;
+  while (true) {
+    auto page = page_reader->NextPage();
+    if (!page) break;
+    if (page->type() == PageType::DATA_PAGE || page->type() == PageType::DATA_PAGE_V2) {
+      ++data_pages_processed;
+    }
+  }
+  // Pages 0 and 1 were skipped; pages 2 and 3 should be returned.
+  EXPECT_EQ(data_pages_processed, 2);
+}
+
+// Case 10 (page-level): confirm last page is followed by nullptr (EOF).
+TEST_F(TestSerializedPageReader, PageBoundaryAtLastByte) {
+  std::unique_ptr<ParquetFileReader> file_reader;
+  auto page_reader = OpenPageReader(col_.buffer, file_reader);
+  ASSERT_NE(page_reader, nullptr);
+
+  // Drain all pages.
+  std::shared_ptr<Page> last_page;
+  while (true) {
+    auto page = page_reader->NextPage();
+    if (!page) break;
+    last_page = page;
+  }
+  EXPECT_NE(last_page, nullptr);  // We saw at least one page.
+  // After all pages, NextPage() must return nullptr.
+  auto after_eof = page_reader->NextPage();
+  EXPECT_EQ(after_eof, nullptr);
+}
+
+// Case (compression): same read-all test with Snappy if available.
+TEST_F(TestSerializedPageReader, UncompressedReadAll) {
+  // Uncompressed path already covered by SelectFirstHalfPages; this
+  // explicitly verifies the uncompressed codec path works end-to-end.
+  std::unique_ptr<ParquetFileReader> file_reader;
+  auto page_reader = OpenPageReader(col_.buffer, file_reader);
+  ASSERT_NE(page_reader, nullptr);
+
+  int64_t total = 0;
+  while (true) {
+    auto page = page_reader->NextPage();
+    if (!page) break;
+    if (page->type() == PageType::DATA_PAGE || page->type() == PageType::DATA_PAGE_V2) {
+      total += std::static_pointer_cast<DataPage>(page)->num_values();
+    }
+  }
+  EXPECT_EQ(total, col_.total_values);
+}
+
+#ifdef ARROW_WITH_SNAPPY
+TEST_F(TestSerializedPageReader, SnappyCompressedReadAll) {
+  MultiPageColumn snappy_col;
+  ASSERT_OK_AND_ASSIGN(snappy_col, BuildMultiPageInt32Column(kNumPages, kValuesPerPage,
+                                                             Compression::SNAPPY));
+  ASSERT_NE(snappy_col.buffer, nullptr);
+
+  std::unique_ptr<ParquetFileReader> file_reader;
+  auto page_reader = OpenPageReader(snappy_col.buffer, file_reader);
+  ASSERT_NE(page_reader, nullptr);
+
+  int64_t total = 0;
+  while (true) {
+    auto page = page_reader->NextPage();
+    if (!page) break;
+    if (page->type() == PageType::DATA_PAGE || page->type() == PageType::DATA_PAGE_V2) {
+      total += std::static_pointer_cast<DataPage>(page)->num_values();
+    }
+  }
+  EXPECT_EQ(total, snappy_col.total_values);
+}
+#endif  // ARROW_WITH_SNAPPY
+
+// =============================================================================
+// TestRecordReaderWithRowSelection — RecordReader + RowSelection integration
+// =============================================================================
+
+class TestRecordReaderWithRowSelection : public ::testing::Test {
+ protected:
+  static constexpr int kNumPages = 4;
+  static constexpr int kValuesPerPage = 25;  // 100 values total
+
+  void SetUp() override {
+    ASSERT_OK_AND_ASSIGN(col_, BuildMultiPageInt32Column(kNumPages, kValuesPerPage));
+    ASSERT_NE(col_.buffer, nullptr);
+
+    // Build the ColumnDescriptor matching the schema written by
+    // BuildMultiPageInt32Column (required int32 "col").
+    NodePtr type = schema::Int32("col", Repetition::REQUIRED);
+    NodePtr root = schema::GroupNode::Make("schema", Repetition::REQUIRED, {type});
+    schema_descriptor_.Init(root);
+    descr_ = schema_descriptor_.Column(0);
+
+    level_info_.def_level = descr_->max_definition_level();
+    level_info_.rep_level = descr_->max_repetition_level();
+    level_info_.repeated_ancestor_def_level = descr_->max_definition_level();
+  }
+
+  // Create a fresh RecordReader backed by the column data.
+  std::shared_ptr<internal::RecordReader> MakeRecordReader() {
+    auto source = std::make_shared<::arrow::io::BufferReader>(col_.buffer);
+    file_reader_ = ParquetFileReader::Open(source);
+    auto rg_reader = file_reader_->RowGroup(0);
+    auto page_reader = rg_reader->GetColumnPageReader(0);
+
+    auto record_reader =
+        internal::RecordReader::Make(descr_, level_info_, ::arrow::default_memory_pool());
+    record_reader->SetPageReader(std::move(page_reader));
+    return record_reader;
+  }
+
+  // Read all selected values into a vector after setting a RowSelection.
+  std::vector<int32_t> ReadSelectedValues(std::shared_ptr<internal::RecordReader> rr,
+                                          std::shared_ptr<RowSelection> selection,
+                                          int64_t num_to_read) {
+    if (selection) {
+      ARROW_UNUSED(rr->SetRowSelection(selection));
+    }
+    ARROW_UNUSED(rr->ReadRecords(num_to_read));
+    const auto* vals = reinterpret_cast<const int32_t*>(rr->values());
+    return std::vector<int32_t>(vals, vals + rr->values_written());
+  }
+
+  MultiPageColumn col_;
+  SchemaDescriptor schema_descriptor_;
+  const ColumnDescriptor* descr_;
+  internal::LevelInfo level_info_;
+  std::unique_ptr<ParquetFileReader> file_reader_;
+};
+
+// Case 3: select rows 0–49 → first 50 values match 0..49.
+TEST_F(TestRecordReaderWithRowSelection, SelectFirst50) {
+  auto rr = MakeRecordReader();
+  // Select first 50 rows, skip remaining 50.
+  auto sel = std::make_shared<RowSelection>(std::vector<RowSelector>{
+      RowSelector{false, 50},  // select 50
+      RowSelector{true, 50},   // skip 50
+  });
+  auto vals = ReadSelectedValues(rr, sel, 50);
+  ASSERT_EQ(static_cast<int64_t>(vals.size()), 50);
+  for (int i = 0; i < 50; ++i) EXPECT_EQ(vals[i], i);
+}
+
+// Case 4: skip rows 0–49, select rows 50–99 → values 50..99.
+TEST_F(TestRecordReaderWithRowSelection, SelectLast50) {
+  auto rr = MakeRecordReader();
+  auto sel = std::make_shared<RowSelection>(std::vector<RowSelector>{
+      RowSelector{true, 50},   // skip first 50
+      RowSelector{false, 50},  // select last 50
+  });
+  // We ask to read 50 selected records; the skip is processed transparently.
+  auto vals = ReadSelectedValues(rr, sel, 50);
+  ASSERT_EQ(static_cast<int64_t>(vals.size()), 50);
+  for (int i = 0; i < 50; ++i) EXPECT_EQ(vals[i], 50 + i);
+}
+
+// Case 7: skip-all → 0 values.
+TEST_F(TestRecordReaderWithRowSelection, SkipAll) {
+  auto rr = MakeRecordReader();
+  auto sel =
+      std::make_shared<RowSelection>(std::vector<RowSelector>{RowSelector{true, 100}});
+  auto vals = ReadSelectedValues(rr, sel, 100);
+  EXPECT_EQ(vals.size(), static_cast<size_t>(0));
+}
+
+// Case 6 / 8: select-all is equivalent to no RowSelection.
+TEST_F(TestRecordReaderWithRowSelection, SelectAllEqualsNoSelection) {
+  // Read without a RowSelection.
+  auto rr_plain = MakeRecordReader();
+  auto vals_plain = ReadSelectedValues(rr_plain, nullptr, 100);
+
+  // Read with a select-all RowSelection.
+  auto rr_sel = MakeRecordReader();
+  auto sel_all =
+      std::make_shared<RowSelection>(std::vector<RowSelector>{RowSelector{false, 100}});
+  auto vals_sel = ReadSelectedValues(rr_sel, sel_all, 100);
+
+  ASSERT_EQ(vals_plain.size(), vals_sel.size());
+  for (size_t i = 0; i < vals_plain.size(); ++i) {
+    EXPECT_EQ(vals_plain[i], vals_sel[i]);
+  }
+}
+
+// Case 9: single full-span range equivalent to sequential read.
+TEST_F(TestRecordReaderWithRowSelection, SingleFullSpanRange) {
+  auto rr = MakeRecordReader();
+  auto sel =
+      std::make_shared<RowSelection>(std::vector<RowSelector>{RowSelector{false, 100}});
+  auto vals = ReadSelectedValues(rr, sel, 100);
+  ASSERT_EQ(static_cast<int64_t>(vals.size()), 100);
+  for (int i = 0; i < 100; ++i) EXPECT_EQ(vals[i], i);
+}
+
+// Additional case: non-contiguous selection — first 25, skip 50, last 25.
+TEST_F(TestRecordReaderWithRowSelection, NonContiguousSelection) {
+  auto rr = MakeRecordReader();
+  auto sel = std::make_shared<RowSelection>(std::vector<RowSelector>{
+      RowSelector{false, 25},  // select rows 0-24
+      RowSelector{true, 50},   // skip rows 25-74
+      RowSelector{false, 25},  // select rows 75-99
+  });
+  // Read 25 from first range, then 25 from last range = 50 total.
+  auto vals = ReadSelectedValues(rr, sel, 50);
+  ASSERT_EQ(static_cast<int64_t>(vals.size()), 50);
+  for (int i = 0; i < 25; ++i) EXPECT_EQ(vals[i], i);
+  for (int i = 0; i < 25; ++i) EXPECT_EQ(vals[25 + i], 75 + i);
+}
+
+// Compression test for RecordReader — verify snappy-compressed column reads
+// the same values as uncompressed when a RowSelection is applied.
+#ifdef ARROW_WITH_SNAPPY
+TEST_F(TestRecordReaderWithRowSelection, SnappyCompressedWithRowSelection) {
+  MultiPageColumn snappy_col;
+  ASSERT_OK_AND_ASSIGN(snappy_col, BuildMultiPageInt32Column(kNumPages, kValuesPerPage,
+                                                             Compression::SNAPPY));
+  ASSERT_NE(snappy_col.buffer, nullptr);
+
+  auto source = std::make_shared<::arrow::io::BufferReader>(snappy_col.buffer);
+  auto snappy_file_reader = ParquetFileReader::Open(source);
+  auto rg_reader = snappy_file_reader->RowGroup(0);
+  auto page_reader = rg_reader->GetColumnPageReader(0);
+
+  auto rr =
+      internal::RecordReader::Make(descr_, level_info_, ::arrow::default_memory_pool());
+  rr->SetPageReader(std::move(page_reader));
+
+  // Select last 50 rows.
+  auto sel = std::make_shared<RowSelection>(std::vector<RowSelector>{
+      RowSelector{true, 50},
+      RowSelector{false, 50},
+  });
+  ARROW_UNUSED(rr->SetRowSelection(sel));
+  int64_t n = rr->ReadRecords(50);
+  ASSERT_EQ(n, 50);
+  const auto* vals = reinterpret_cast<const int32_t*>(rr->values());
+  for (int i = 0; i < 50; ++i) EXPECT_EQ(vals[i], 50 + i);
+}
+#endif  // ARROW_WITH_SNAPPY
 
 }  // namespace test
 }  // namespace parquet

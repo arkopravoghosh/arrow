@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <unordered_set>
 #include <utility>
@@ -30,7 +31,9 @@
 #include "parquet/column_reader.h"
 #include "parquet/file_reader.h"
 #include "parquet/metadata.h"
+#include "parquet/page_index.h"
 #include "parquet/platform.h"
+#include "parquet/row_selection.h"
 #include "parquet/schema.h"
 
 namespace arrow {
@@ -71,7 +74,7 @@ class FileColumnIterator {
 
   virtual ~FileColumnIterator() {}
 
-  std::unique_ptr<::parquet::PageReader> NextChunk() {
+  virtual std::unique_ptr<::parquet::PageReader> NextChunk() {
     if (row_groups_.empty()) {
       return nullptr;
     }
@@ -110,6 +113,59 @@ class FileColumnIterator {
 
 using FileColumnIteratorFactory =
     std::function<FileColumnIterator*(int, ParquetFileReader*)>;
+
+// SparsePagesColumnIterator enables page-level I/O pruning by using RowSelection
+// to skip non-matching pages during reads. It overrides NextChunk() to call
+// GetColumnPageReaderWithRowSelection instead of GetColumnPageReader.
+class SparsePagesColumnIterator : public FileColumnIterator {
+ public:
+  explicit SparsePagesColumnIterator(
+      int column_index, ParquetFileReader* reader, std::vector<int> row_groups,
+      std::map<int, std::shared_ptr<RowSelection>> row_selections)
+      : FileColumnIterator(column_index, reader, std::move(row_groups)),
+        row_selections_(std::move(row_selections)) {}
+
+  std::unique_ptr<::parquet::PageReader> NextChunk() override {
+    if (row_groups_.empty()) {
+      return nullptr;
+    }
+
+    row_group_index_ = row_groups_.front();
+    auto row_group_reader = reader_->RowGroup(row_group_index_);
+    row_groups_.pop_front();
+
+    // Check if this row group has a RowSelection
+    auto sel_it = row_selections_.find(row_group_index_);
+    if (sel_it == row_selections_.end() || !sel_it->second) {
+      // No selection for this row group, use plain read
+      return row_group_reader->GetColumnPageReader(column_index_);
+    }
+
+    // Load OffsetIndex for this column+row_group from the page index reader
+    std::shared_ptr<OffsetIndex> offset_index;
+    auto page_index_reader = reader_->GetPageIndexReader();
+    if (page_index_reader) {
+      auto rg_index = page_index_reader->RowGroup(row_group_index_);
+      if (rg_index) {
+        offset_index = rg_index->GetOffsetIndex(column_index_);
+      }
+    }
+
+    if (!offset_index) {
+      // No OffsetIndex available, fall back to plain read
+      return row_group_reader->GetColumnPageReader(column_index_);
+    }
+
+    int64_t rg_row_count = reader_->metadata()->RowGroup(row_group_index_)->num_rows();
+
+    // Use sparse I/O: only selected page byte ranges are fetched from disk
+    return row_group_reader->GetColumnPageReaderWithRowSelection(
+        column_index_, sel_it->second.get(), offset_index.get(), rg_row_count);
+  }
+
+ private:
+  std::map<int, std::shared_ptr<RowSelection>> row_selections_;
+};
 
 struct ReaderContext {
   ParquetFileReader* reader;
