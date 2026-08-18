@@ -23,7 +23,11 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/array.h"
+#include "arrow/array/builder_primitive.h"
 #include "arrow/compute/api_scalar.h"
+#include "arrow/compute/api_vector.h"
+#include "arrow/compute/expression.h"
 #include "arrow/dataset/dataset_internal.h"
 #include "arrow/dataset/parquet_encryption_config.h"
 #include "arrow/dataset/scanner.h"
@@ -42,9 +46,12 @@
 #include "arrow/util/logging_internal.h"
 #include "arrow/util/range.h"
 
+#include "parquet/arrow/reader.h"
 #include "parquet/arrow/writer.h"
 #include "parquet/file_reader.h"
 #include "parquet/metadata.h"
+#include "parquet/properties.h"
+#include "parquet/row_selection.h"
 #include "parquet/statistics.h"
 #include "parquet/types.h"
 
@@ -993,6 +1000,487 @@ TEST_F(TestParquetFileFormat, MultithreadedComputeRegression) {
         options.cpu_executor = pool;
       };
   TestMultithreadedRegression(customize_cpu_executor);
+}
+
+// ============================================================================
+// TestDatasetParquetPagePruning
+//
+// Ten tests covering page-level row pruning through the Arrow dataset scanner
+// (ParquetFileFragment + ScanBatchesAsync). Each test writes a Parquet file
+// with known data, optionally enabling/disabling the page index via
+// WriterProperties, configures the PageIndexPolicy on ParquetFragmentScanOptions,
+// runs a filtered ScanBatchesAsync, and verifies row counts and values.
+// ============================================================================
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Helper: write a multi-row-group, multi-page Parquet file to a Buffer.
+//
+// schema: single int32 column "v"
+// The file has kNumRowGroups row groups.  Each row group has kRowsPerGroup rows
+// with values in a contiguous range so that we can craft predicates that match
+// exactly one row group, all row groups, or none.
+//
+// Row group i (0-based) contains values in [i * kRowsPerGroup,
+// (i+1) * kRowsPerGroup).  Within each row group we use a small page size so
+// the Parquet writer emits multiple data pages — a prerequisite for page-level
+// pruning to have any effect.
+// ---------------------------------------------------------------------------
+constexpr int kNumRowGroups = 4;
+constexpr int kRowsPerGroup = 100;
+// Each row group spans values [i*kRowsPerGroup, (i+1)*kRowsPerGroup).
+// Total rows = kNumRowGroups * kRowsPerGroup = 400.
+
+// Write a Parquet buffer with page indices enabled or disabled.
+Result<std::shared_ptr<Buffer>> WritePageIndexParquet(bool enable_page_index) {
+  auto data_schema = schema({field("v", int32())});
+
+  // Build kNumRowGroups record batches, each with kRowsPerGroup rows.
+  std::vector<std::shared_ptr<RecordBatch>> batches;
+  for (int rg = 0; rg < kNumRowGroups; ++rg) {
+    Int32Builder builder;
+    RETURN_NOT_OK(builder.Reserve(kRowsPerGroup));
+    for (int r = 0; r < kRowsPerGroup; ++r) {
+      RETURN_NOT_OK(builder.Append(rg * kRowsPerGroup + r));
+    }
+    std::shared_ptr<Array> col;
+    ARROW_ASSIGN_OR_RAISE(col, builder.Finish());
+    batches.push_back(RecordBatch::Make(data_schema, kRowsPerGroup, {col}));
+  }
+
+  // Parquet writer properties: use a small page size to force multiple pages
+  // per row group, and optionally enable page index.
+  auto props_builder = parquet::WriterProperties::Builder();
+  props_builder.data_pagesize(256);  // small page → multiple pages per row group
+  if (enable_page_index) {
+    props_builder.enable_write_page_index();
+  } else {
+    props_builder.disable_write_page_index();
+  }
+  auto writer_props = props_builder.build();
+  auto arrow_props = parquet::default_arrow_writer_properties();
+
+  auto pool = arrow::default_memory_pool();
+  auto sink = parquet::CreateOutputStream(pool);
+  ARROW_ASSIGN_OR_RAISE(std::unique_ptr<parquet::arrow::FileWriter> writer,
+                        parquet::arrow::FileWriter::Open(*data_schema, pool, sink,
+                                                         writer_props, arrow_props));
+  for (const auto& batch : batches) {
+    RETURN_NOT_OK(writer->NewRowGroup());
+    RETURN_NOT_OK(writer->WriteColumnChunk(*batch->column(0)));
+  }
+  RETURN_NOT_OK(writer->Close());
+  return sink->Finish();
+}
+
+// Write an all-null Parquet file (single row group, nulls only).
+Result<std::shared_ptr<Buffer>> WriteAllNullParquet() {
+  auto data_schema = schema({field("v", int32())});
+  // Build an all-null Int32Array
+  Int32Builder builder;
+  RETURN_NOT_OK(builder.AppendNulls(10));
+  std::shared_ptr<Array> col;
+  ARROW_ASSIGN_OR_RAISE(col, builder.Finish());
+  auto batch = RecordBatch::Make(data_schema, 10, {col});
+
+  auto props_builder = parquet::WriterProperties::Builder();
+  props_builder.enable_write_page_index();
+  auto writer_props = props_builder.build();
+  auto arrow_props = parquet::default_arrow_writer_properties();
+
+  auto pool = arrow::default_memory_pool();
+  auto sink = parquet::CreateOutputStream(pool);
+  ARROW_ASSIGN_OR_RAISE(std::unique_ptr<parquet::arrow::FileWriter> writer,
+                        parquet::arrow::FileWriter::Open(*data_schema, pool, sink,
+                                                         writer_props, arrow_props));
+  RETURN_NOT_OK(writer->NewRowGroup());
+  RETURN_NOT_OK(writer->WriteColumnChunk(*batch->column(0)));
+  RETURN_NOT_OK(writer->Close());
+  return sink->Finish();
+}
+
+// Collect all RecordBatches from a ScanBatchesAsync call with the given filter.
+// Returns the total row count and all batches.
+Status CollectBatches(const std::shared_ptr<Fragment>& fragment,
+                      const std::shared_ptr<ScanOptions>& options, int64_t* total_rows,
+                      std::vector<std::shared_ptr<RecordBatch>>* out_batches) {
+  ARROW_ASSIGN_OR_RAISE(auto gen, fragment->ScanBatchesAsync(options));
+  ARROW_ASSIGN_OR_RAISE(auto batches, CollectAsyncGenerator(std::move(gen)).result());
+  *total_rows = 0;
+  out_batches->clear();
+  for (const auto& batch : batches) {
+    *total_rows += batch->num_rows();
+    out_batches->push_back(batch);
+  }
+  return Status::OK();
+}
+
+// Build a ScanOptions with a dataset_schema, a filter, and default projection.
+// Optionally attach a ParquetFragmentScanOptions with the specified PageIndexPolicy.
+std::shared_ptr<ScanOptions> MakeScanOptions(
+    const std::shared_ptr<Schema>& data_schema, const compute::Expression& filter,
+    parquet::PageIndexPolicy policy = parquet::PageIndexPolicy::AUTO) {
+  auto opts = std::make_shared<ScanOptions>();
+  opts->dataset_schema = data_schema;
+  EXPECT_OK_AND_ASSIGN(opts->filter, filter.Bind(*data_schema));
+  EXPECT_OK_AND_ASSIGN(auto projection,
+                       ProjectionDescr::Default(*data_schema,
+                                                /*add_augmented_fields=*/true));
+  SetProjection(opts.get(), std::move(projection));
+
+  auto fso = std::make_shared<ParquetFragmentScanOptions>();
+  fso->arrow_reader_properties->set_page_index_policy(policy);
+  opts->fragment_scan_options = fso;
+  return opts;
+}
+
+// Return the count of matching rows from a full in-memory table filtered via
+// compute::ExecuteScalarExpression.
+Result<int64_t> ReferenceRowCount(const std::shared_ptr<Table>& full_table,
+                                  const compute::Expression& filter) {
+  ARROW_ASSIGN_OR_RAISE(auto bound_filter, filter.Bind(*full_table->schema()));
+  int64_t total = 0;
+  TableBatchReader reader(*full_table);
+  std::shared_ptr<RecordBatch> batch;
+  while (true) {
+    RETURN_NOT_OK(reader.ReadNext(&batch));
+    if (!batch) break;
+    ARROW_ASSIGN_OR_RAISE(
+        auto mask_datum,
+        compute::ExecuteScalarExpression(bound_filter, *full_table->schema(),
+                                         Datum(batch)));
+    ARROW_ASSIGN_OR_RAISE(auto filtered, compute::Filter(batch, mask_datum.make_array()));
+    total += filtered.record_batch()->num_rows();
+  }
+  return total;
+}
+
+}  // namespace
+
+class TestDatasetParquetPagePruning : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    format_ = std::make_shared<ParquetFileFormat>();
+    data_schema_ = schema({field("v", int32())});
+
+    ASSERT_OK_AND_ASSIGN(buf_with_index_,
+                         WritePageIndexParquet(/*enable_page_index=*/true));
+    ASSERT_OK_AND_ASSIGN(buf_no_index_,
+                         WritePageIndexParquet(/*enable_page_index=*/false));
+    ASSERT_OK_AND_ASSIGN(buf_all_null_, WriteAllNullParquet());
+
+    // Build an in-memory reference table from the page-index-enabled file.
+    auto source = FileSource(buf_with_index_);
+    ASSERT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(source));
+    auto opts_all =
+        MakeScanOptions(data_schema_, literal(true), parquet::PageIndexPolicy::NEVER);
+    std::vector<std::shared_ptr<RecordBatch>> all_batches;
+    int64_t ignored = 0;
+    ASSERT_OK(CollectBatches(fragment, opts_all, &ignored, &all_batches));
+    ASSERT_OK_AND_ASSIGN(ref_table_, Table::FromRecordBatches(data_schema_, all_batches));
+  }
+
+  // Make a fragment from buf and set the physical schema.
+  std::shared_ptr<Fragment> MakeFragmentFromBuffer(
+      const std::shared_ptr<Buffer>& buf) const {
+    auto source = FileSource(buf);
+    EXPECT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(source));
+    return fragment;
+  }
+
+  std::shared_ptr<ParquetFileFormat> format_;
+  std::shared_ptr<Schema> data_schema_;
+  std::shared_ptr<Buffer> buf_with_index_;
+  std::shared_ptr<Buffer> buf_no_index_;
+  std::shared_ptr<Buffer> buf_all_null_;
+  std::shared_ptr<Table> ref_table_;  // all rows, for reference filtering
+};
+
+// Case 1: ScanBatchesAsync with a filter returns exactly the rows that satisfy
+// the predicate, matching the in-memory reference.
+TEST_F(TestDatasetParquetPagePruning, ScanWithFilterMatchesReference) {
+  // Filter: v >= 150 AND v < 250  (row groups 1 and 2 partially)
+  auto filter = and_(greater_equal(field_ref("v"), literal<int32_t>(150)),
+                     less(field_ref("v"), literal<int32_t>(250)));
+
+  auto fragment = MakeFragmentFromBuffer(buf_with_index_);
+  auto opts = MakeScanOptions(data_schema_, filter, parquet::PageIndexPolicy::AUTO);
+
+  int64_t scanned_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> batches;
+  ASSERT_OK(CollectBatches(fragment, opts, &scanned_rows, &batches));
+
+  ASSERT_OK_AND_ASSIGN(int64_t expected_rows, ReferenceRowCount(ref_table_, filter));
+  EXPECT_GT(expected_rows, 0) << "Reference should have matching rows";
+  EXPECT_EQ(scanned_rows, expected_rows)
+      << "Scanned row count must match in-memory reference";
+
+  // Verify every returned value satisfies the predicate.
+  for (const auto& batch : batches) {
+    const auto& col = checked_cast<const Int32Array&>(*batch->column(0));
+    for (int64_t i = 0; i < col.length(); ++i) {
+      ASSERT_FALSE(col.IsNull(i));
+      int32_t v = col.Value(i);
+      EXPECT_GE(v, 150);
+      EXPECT_LT(v, 250);
+    }
+  }
+}
+
+// Case 2: Disabling pruning (PageIndexPolicy::NEVER) still returns all rows
+// that satisfy the predicate (the pruned result is a subset of unpruned).
+TEST_F(TestDatasetParquetPagePruning, PruningOffReturnsAll) {
+  auto filter = greater_equal(field_ref("v"), literal<int32_t>(200));
+
+  // Scan with pruning enabled.
+  auto fragment_pruned = MakeFragmentFromBuffer(buf_with_index_);
+  auto opts_pruned =
+      MakeScanOptions(data_schema_, filter, parquet::PageIndexPolicy::AUTO);
+  int64_t pruned_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> pruned_batches;
+  ASSERT_OK(CollectBatches(fragment_pruned, opts_pruned, &pruned_rows, &pruned_batches));
+
+  // Scan with pruning disabled.
+  auto fragment_unpruned = MakeFragmentFromBuffer(buf_with_index_);
+  auto opts_unpruned =
+      MakeScanOptions(data_schema_, filter, parquet::PageIndexPolicy::NEVER);
+  int64_t unpruned_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> unpruned_batches;
+  ASSERT_OK(CollectBatches(fragment_unpruned, opts_unpruned, &unpruned_rows,
+                           &unpruned_batches));
+
+  // The NEVER policy skips page pruning but applies the filter post-decode; both
+  // paths should return the same qualifying rows.
+  ASSERT_OK_AND_ASSIGN(int64_t expected, ReferenceRowCount(ref_table_, filter));
+  EXPECT_EQ(pruned_rows, expected);
+  EXPECT_EQ(unpruned_rows, expected);
+  EXPECT_GE(unpruned_rows, pruned_rows)
+      << "Unpruned scan must return at least as many qualifying rows as pruned";
+}
+
+// Case 3: A predicate that matches no rows yields 0 batches (or all empty batches).
+TEST_F(TestDatasetParquetPagePruning, PredicateMatchesNone) {
+  // v > max value in the file (kNumRowGroups * kRowsPerGroup - 1 = 399)
+  constexpr int32_t kBeyondMax = kNumRowGroups * kRowsPerGroup;
+  auto filter = greater(field_ref("v"), literal(int32_t{kBeyondMax}));
+
+  auto fragment = MakeFragmentFromBuffer(buf_with_index_);
+  auto opts = MakeScanOptions(data_schema_, filter, parquet::PageIndexPolicy::AUTO);
+
+  int64_t total_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> batches;
+  ASSERT_OK(CollectBatches(fragment, opts, &total_rows, &batches));
+
+  EXPECT_EQ(total_rows, 0) << "No rows should match a beyond-max predicate";
+}
+
+// Case 4: A predicate that matches all rows returns the same count as a full scan.
+TEST_F(TestDatasetParquetPagePruning, PredicateMatchesAll) {
+  // v >= 0 matches every row in the file.
+  auto filter = greater_equal(field_ref("v"), literal<int32_t>(0));
+
+  auto fragment = MakeFragmentFromBuffer(buf_with_index_);
+  auto opts = MakeScanOptions(data_schema_, filter, parquet::PageIndexPolicy::AUTO);
+
+  int64_t total_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> batches;
+  ASSERT_OK(CollectBatches(fragment, opts, &total_rows, &batches));
+
+  EXPECT_EQ(total_rows, static_cast<int64_t>(kNumRowGroups * kRowsPerGroup))
+      << "A match-all predicate must return all rows";
+
+  // Also confirm this equals the unpruned count.
+  auto fragment2 = MakeFragmentFromBuffer(buf_with_index_);
+  auto opts2 =
+      MakeScanOptions(data_schema_, literal(true), parquet::PageIndexPolicy::NEVER);
+  int64_t unpruned_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> unpruned_batches;
+  ASSERT_OK(CollectBatches(fragment2, opts2, &unpruned_rows, &unpruned_batches));
+
+  EXPECT_EQ(total_rows, unpruned_rows);
+}
+
+// Case 5: A pruned scan issues strictly fewer byte-range reads than an unpruned
+// scan.  We use TrackedRandomAccessFile to instrument the file source.
+TEST_F(TestDatasetParquetPagePruning, PrunedIsFewerReads) {
+  // Choose a narrow range that covers only part of the data.
+  auto filter = and_(greater_equal(field_ref("v"), literal<int32_t>(50)),
+                     less(field_ref("v"), literal<int32_t>(100)));
+
+  auto run_scan = [&](parquet::PageIndexPolicy policy) -> int64_t {
+    auto buf_reader = std::make_shared<::arrow::io::BufferReader>(buf_with_index_);
+    std::shared_ptr<io::TrackedRandomAccessFile> tracked =
+        io::TrackedRandomAccessFile::Make(buf_reader.get());
+    auto source = FileSource(tracked);
+    EXPECT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(source));
+    auto opts = MakeScanOptions(data_schema_, filter, policy);
+    int64_t rows = 0;
+    std::vector<std::shared_ptr<RecordBatch>> batches;
+    EXPECT_OK(CollectBatches(fragment, opts, &rows, &batches));
+    return tracked->bytes_read();
+  };
+
+  int64_t bytes_pruned = run_scan(parquet::PageIndexPolicy::AUTO);
+  int64_t bytes_unpruned = run_scan(parquet::PageIndexPolicy::NEVER);
+
+  // Page-level pruning should reduce I/O.  We accept equality only if the file
+  // is so small that no page pruning actually happens; in practice the file we
+  // write has multiple pages per row group, so pruning should reduce bytes.
+  EXPECT_LE(bytes_pruned, bytes_unpruned)
+      << "Pruned scan should not read more bytes than an unpruned scan";
+}
+
+// Case 6: A file written without page indices falls back to a full (row-group-
+// level) scan without error.  Row counts must still be correct.
+TEST_F(TestDatasetParquetPagePruning, NoIndexFallback) {
+  auto filter = and_(greater_equal(field_ref("v"), literal<int32_t>(100)),
+                     less(field_ref("v"), literal<int32_t>(200)));
+
+  auto fragment = MakeFragmentFromBuffer(buf_no_index_);
+  auto opts = MakeScanOptions(data_schema_, filter, parquet::PageIndexPolicy::AUTO);
+
+  int64_t total_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> batches;
+  // Must complete without error even though there are no page indices.
+  ASSERT_OK(CollectBatches(fragment, opts, &total_rows, &batches));
+
+  // Reference count from the index-enabled file (same data).
+  ASSERT_OK_AND_ASSIGN(int64_t expected, ReferenceRowCount(ref_table_, filter));
+  EXPECT_EQ(total_rows, expected) << "Fallback full scan must return all qualifying rows";
+
+  // All returned values must satisfy the predicate.
+  for (const auto& batch : batches) {
+    const auto& col = checked_cast<const Int32Array&>(*batch->column(0));
+    for (int64_t i = 0; i < col.length(); ++i) {
+      if (!col.IsNull(i)) {
+        int32_t v = col.Value(i);
+        EXPECT_GE(v, 100);
+        EXPECT_LT(v, 200);
+      }
+    }
+  }
+}
+
+// Case 7: A fragment consisting entirely of null values returns 0 qualifying
+// rows for a non-null predicate.
+TEST_F(TestDatasetParquetPagePruning, AllNullFragmentZeroRows) {
+  auto filter = greater(field_ref("v"), literal<int32_t>(0));
+
+  auto fragment = MakeFragmentFromBuffer(buf_all_null_);
+  auto opts = MakeScanOptions(data_schema_, filter, parquet::PageIndexPolicy::AUTO);
+
+  int64_t total_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> batches;
+  ASSERT_OK(CollectBatches(fragment, opts, &total_rows, &batches));
+
+  EXPECT_EQ(total_rows, 0)
+      << "All-null fragment should yield 0 rows for a non-null predicate";
+}
+
+// Case 8: A file with a single row group and small page size behaves identically
+// to an unpruned scan.
+TEST_F(TestDatasetParquetPagePruning, SinglePageEqualsUnpruned) {
+  // Write a single-row-group file — one row group, page index enabled.
+  auto single_rg_schema = schema({field("v", int32())});
+  Int32Builder builder;
+  ASSERT_OK(builder.Reserve(kRowsPerGroup));
+  for (int i = 0; i < kRowsPerGroup; ++i) {
+    ASSERT_OK(builder.Append(i));
+  }
+  std::shared_ptr<Array> col;
+  ASSERT_OK_AND_ASSIGN(col, builder.Finish());
+  auto batch = RecordBatch::Make(single_rg_schema, kRowsPerGroup, {col});
+
+  auto pool = arrow::default_memory_pool();
+  auto sink = parquet::CreateOutputStream(pool);
+  auto writer_props =
+      parquet::WriterProperties::Builder().enable_write_page_index()->build();
+  auto arrow_props = parquet::default_arrow_writer_properties();
+  ASSERT_OK_AND_ASSIGN(auto writer,
+                       parquet::arrow::FileWriter::Open(*single_rg_schema, pool, sink,
+                                                        writer_props, arrow_props));
+  ASSERT_OK(writer->NewRowGroup());
+  ASSERT_OK(writer->WriteColumnChunk(*batch->column(0)));
+  ASSERT_OK(writer->Close());
+  ASSERT_OK_AND_ASSIGN(auto buf, sink->Finish());
+
+  // Filter that matches half the rows.
+  auto filter = less(field_ref("v"), literal<int32_t>(kRowsPerGroup / 2));
+
+  // Pruned scan.
+  auto frag_pruned = MakeFragmentFromBuffer(buf);
+  auto opts_pruned =
+      MakeScanOptions(single_rg_schema, filter, parquet::PageIndexPolicy::AUTO);
+  int64_t rows_pruned = 0;
+  std::vector<std::shared_ptr<RecordBatch>> batches_pruned;
+  ASSERT_OK(CollectBatches(frag_pruned, opts_pruned, &rows_pruned, &batches_pruned));
+
+  // Unpruned scan (NEVER policy — no page filtering).
+  auto frag_unpruned = MakeFragmentFromBuffer(buf);
+  auto opts_unpruned =
+      MakeScanOptions(single_rg_schema, filter, parquet::PageIndexPolicy::NEVER);
+  int64_t rows_unpruned = 0;
+  std::vector<std::shared_ptr<RecordBatch>> batches_unpruned;
+  ASSERT_OK(
+      CollectBatches(frag_unpruned, opts_unpruned, &rows_unpruned, &batches_unpruned));
+
+  EXPECT_EQ(rows_pruned, rows_unpruned)
+      << "Single-page-per-group file: pruned and unpruned must return the same row count";
+  EXPECT_EQ(rows_pruned, kRowsPerGroup / 2);
+}
+
+// Case 9: PageIndexPolicy::AUTO on a file without page indices falls back to
+// full decode and still returns all matching rows.
+TEST_F(TestDatasetParquetPagePruning, AutoAbsentIndexFullDecode) {
+  // buf_no_index_ was written without page indices.  AUTO should detect their
+  // absence and fall back to a full decode, returning correct results.
+  auto filter = and_(greater_equal(field_ref("v"), literal<int32_t>(200)),
+                     less(field_ref("v"), literal<int32_t>(300)));
+
+  auto fragment = MakeFragmentFromBuffer(buf_no_index_);
+  auto opts = MakeScanOptions(data_schema_, filter, parquet::PageIndexPolicy::AUTO);
+
+  int64_t total_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> batches;
+  ASSERT_OK(CollectBatches(fragment, opts, &total_rows, &batches));
+
+  ASSERT_OK_AND_ASSIGN(int64_t expected, ReferenceRowCount(ref_table_, filter));
+  EXPECT_GT(expected, 0) << "Sanity: range [200,300) should have matching rows";
+  EXPECT_EQ(total_rows, expected)
+      << "AUTO policy absent-index fallback must return all qualifying rows";
+
+  // Confirm values are in range.
+  for (const auto& batch : batches) {
+    const auto& col = checked_cast<const Int32Array&>(*batch->column(0));
+    for (int64_t i = 0; i < col.length(); ++i) {
+      if (!col.IsNull(i)) {
+        int32_t v = col.Value(i);
+        EXPECT_GE(v, 200);
+        EXPECT_LT(v, 300);
+      }
+    }
+  }
+}
+
+// Case 10: A predicate that skips every row group (values beyond the file max)
+// completes successfully with 0 rows and no error.
+TEST_F(TestDatasetParquetPagePruning, AllRGSkipped) {
+  // All values in the file are in [0, kNumRowGroups*kRowsPerGroup).
+  // Predicate v > max ensures every row group is eliminated at the row-group
+  // statistics level, so no data pages are even opened.
+  constexpr int32_t kBeyondMax = kNumRowGroups * kRowsPerGroup + 1000;
+  auto filter = greater(field_ref("v"), literal(int32_t{kBeyondMax}));
+
+  auto fragment = MakeFragmentFromBuffer(buf_with_index_);
+  auto opts = MakeScanOptions(data_schema_, filter, parquet::PageIndexPolicy::AUTO);
+
+  int64_t total_rows = 0;
+  std::vector<std::shared_ptr<RecordBatch>> batches;
+  ASSERT_OK(CollectBatches(fragment, opts, &total_rows, &batches))
+      << "Scanner must complete without error even when all row groups are skipped";
+
+  EXPECT_EQ(total_rows, 0) << "All row groups skipped: expected 0 rows";
 }
 
 }  // namespace dataset

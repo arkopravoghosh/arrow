@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -40,6 +41,7 @@ class RowGroupMetaData;
 class FileMetaData;
 class FileDecryptionProperties;
 class FileEncryptionProperties;
+class RowSelection;
 
 class ReaderProperties;
 class ArrowReaderProperties;
@@ -188,6 +190,28 @@ class ARROW_DS_EXPORT ParquetFileFragment : public FileFragment {
       const Field& field, const FieldRef& field_ref,
       const parquet::Statistics& statistics);
 
+  /// \brief Compute page-level row selections for all row groups, using the
+  /// filter predicate and the file's page indices (ColumnIndex/OffsetIndex).
+  ///
+  /// Requires that metadata has been loaded (EnsureCompleteMetadata must have
+  /// been called) and that the supplied \p reader has been opened.  On
+  /// success, the results are cached in page_selections_: a map from
+  /// row-group index to the intersected RowSelection across all columns that
+  /// participate in the predicate.  If no columns in the predicate have page
+  /// indices available, page_selections_ is left empty (select-all fallback).
+  ///
+  /// Supported predicate subset: a conjunction (AND) of leaf comparisons of the
+  /// form ``field op literal`` (op in ==, <, <=, >, >=) plus ``is_null`` /
+  /// ``is_valid``. Per-column selections are combined with
+  /// RowSelection::Intersect().  OR/NOT and other expression forms are not
+  /// pushed down; they are skipped safely — page pruning is an optimization and
+  /// the exact predicate is always re-applied by the scanner, so skipping a
+  /// sub-expression can only reduce pruning, never change results.
+  ///
+  /// \note API EXPERIMENTAL
+  Status ComputePageSelections(const compute::Expression& predicate,
+                               parquet::arrow::FileReader* reader);
+
  private:
   ParquetFileFragment(FileSource source, std::shared_ptr<FileFormat> format,
                       compute::Expression partition_expression,
@@ -229,6 +253,11 @@ class ARROW_DS_EXPORT ParquetFileFragment : public FileFragment {
   std::shared_ptr<parquet::arrow::SchemaManifest> manifest_;
   // The FileMetaData that owns the SchemaDescriptor pointed by SchemaManifest.
   std::shared_ptr<parquet::FileMetaData> original_metadata_;
+
+  /// Cache of page-level row selections, populated by ComputePageSelections().
+  /// Maps row-group index -> intersected RowSelection across all predicate columns.
+  /// An absent entry means "select all rows" for that row group (no pruning was done).
+  std::map<int, std::shared_ptr<parquet::RowSelection>> page_selections_;
 
   friend class ParquetFileFormat;
   friend class ParquetDatasetFactory;

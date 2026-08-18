@@ -17,6 +17,8 @@
 
 #include "arrow/dataset/file_parquet.h"
 
+#include <any>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -24,6 +26,9 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/array/array_primitive.h"
+#include "arrow/array/builder_primitive.h"
+#include "arrow/compute/api_vector.h"
 #include "arrow/compute/cast.h"
 #include "arrow/compute/exec.h"
 #include "arrow/dataset/dataset_internal.h"
@@ -46,6 +51,7 @@
 #include "parquet/encryption/kms_client.h"
 #include "parquet/file_reader.h"
 #include "parquet/properties.h"
+#include "parquet/row_selection.h"
 #include "parquet/statistics.h"
 
 namespace arrow {
@@ -606,6 +612,52 @@ struct SlicingGenerator {
   std::shared_ptr<State> state;
 };
 
+/// \brief Build a record-batch generator that reads each row group individually
+/// with page-level I/O pruning via RowSelection.
+///
+/// For row groups that have no entry in \p page_selections, the row group is
+/// read normally.  For row groups that do have an entry, only the pages
+/// matching the RowSelection are read from disk via SparseInputStream,
+/// enabling true I/O-level page skipping.
+///
+/// This replaces the default GetRecordBatchGenerator() call when page-level
+/// pruning has produced a non-empty page_selections_ map.
+static Result<RecordBatchGenerator> MakePagePrunedGenerator(
+    const std::shared_ptr<parquet::arrow::FileReader>& reader,
+    const std::vector<int>& row_groups, const std::vector<int>& column_projection,
+    const std::map<int, std::shared_ptr<parquet::RowSelection>>& page_selections,
+    int64_t batch_size, MemoryPool* pool) {
+  // Collect batches for all row groups synchronously (blocking).
+  // This is acceptable here because ScanBatchesAsync already runs inside a
+  // thread-pool task (via MakeFromFuture → GetReaderAsync).
+  std::vector<std::shared_ptr<RecordBatch>> all_batches;
+  for (int rg : row_groups) {
+    std::shared_ptr<Table> table;
+
+    // Check if this row group has a RowSelection for page-level pruning
+    auto it = page_selections.find(rg);
+    if (it != page_selections.end() && it->second) {
+      // Use sparse I/O path: only selected pages are fetched from disk
+      ARROW_ASSIGN_OR_RAISE(
+          table, reader->ReadRowGroupWithRowSelection(rg, column_projection, it->second));
+    } else {
+      // No pruning: read entire row group normally
+      ARROW_ASSIGN_OR_RAISE(table, reader->ReadRowGroup(rg, column_projection));
+    }
+
+    if (table->num_rows() == 0) continue;
+
+    // Split into batches of at most batch_size rows.
+    TableBatchReader tbr(*table);
+    tbr.set_chunksize(batch_size);
+    ARROW_ASSIGN_OR_RAISE(auto batches, tbr.ToRecordBatches());
+    for (auto& batch : batches) {
+      all_batches.push_back(std::move(batch));
+    }
+  }
+  return MakeVectorGenerator(std::move(all_batches));
+}
+
 Result<RecordBatchGenerator> ParquetFileFormat::ScanBatchesAsync(
     const std::shared_ptr<ScanOptions>& options,
     const std::shared_ptr<FileFragment>& file) const {
@@ -634,13 +686,53 @@ Result<RecordBatchGenerator> ParquetFileFormat::ScanBatchesAsync(
                             parquet_fragment->FilterRowGroups(options->filter));
       if (row_groups.empty()) return MakeEmptyGenerator<std::shared_ptr<RecordBatch>>();
     }
-    ARROW_ASSIGN_OR_RAISE(auto column_projection,
-                          InferColumnProjection(*reader, *options));
+
+    // After row-group pruning, attempt page-level pruning on surviving row groups.
+    // ComputePageSelections populates parquet_fragment->page_selections_ with the
+    // intersected RowSelection for each row group.  This is a best-effort
+    // optimization: failures are logged and fall back to row-group-only pruning.
     ARROW_ASSIGN_OR_RAISE(
-        auto parquet_scan_options,
+        auto parquet_scan_options_for_policy,
         GetFragmentScanOptions<ParquetFragmentScanOptions>(
             kParquetTypeName, options.get(), default_fragment_scan_options));
+    const parquet::PageIndexPolicy policy =
+        parquet_scan_options_for_policy->arrow_reader_properties->page_index_policy();
+    if (policy != parquet::PageIndexPolicy::NEVER &&
+        options->filter != compute::literal(true)) {
+      // ComputePageSelections sets arrow_reader_properties on the underlying
+      // ParquetFileReader and fills parquet_fragment->page_selections_.
+      Status page_status =
+          parquet_fragment->ComputePageSelections(options->filter, reader.get());
+      if (policy == parquet::PageIndexPolicy::ALWAYS) {
+        RETURN_NOT_OK(page_status);
+      } else if (!page_status.ok()) {
+        ARROW_LOG(WARNING)
+            << "Page-level pruning failed, falling back to row-group pruning: "
+            << page_status.message();
+      }
+    }
+
+    ARROW_ASSIGN_OR_RAISE(auto column_projection,
+                          InferColumnProjection(*reader, *options));
     int batch_readahead = options->batch_readahead;
+
+    // If page-level pruning produced row selections, use the per-row-group
+    // read+filter path so that page_selections_ is consumed by the I/O layer.
+    if (!parquet_fragment->page_selections_.empty()) {
+      ARROW_ASSIGN_OR_RAISE(auto generator,
+                            MakePagePrunedGenerator(reader, row_groups, column_projection,
+                                                    parquet_fragment->page_selections_,
+                                                    options->batch_size, options->pool));
+      RecordBatchGenerator sliced =
+          SlicingGenerator(std::move(generator), options->batch_size);
+      if (batch_readahead == 0) {
+        return sliced;
+      }
+      RecordBatchGenerator sliced_readahead =
+          MakeSerialReadaheadGenerator(std::move(sliced), batch_readahead);
+      return sliced_readahead;
+    }
+
     int64_t rows_to_readahead = batch_readahead * options->batch_size;
     // Use the executor from scan options if provided.
     auto cpu_executor = options->cpu_executor ? options->cpu_executor
@@ -1000,6 +1092,382 @@ Result<std::optional<int64_t>> ParquetFileFragment::TryCountRows(
     return rows;
   }
   return metadata()->num_rows();
+}
+
+namespace {
+
+/// \brief A single extracted leaf predicate: column index + operator + optional value.
+struct LeafPredicate {
+  int column_index;
+  parquet::PredicateOp op;
+  std::any value;  // empty for is_null / is_not_null
+};
+
+/// Map Arrow compute function names to the PredicateOp accepted by
+/// ParquetFileReader::ComputePageSelection().
+std::optional<parquet::PredicateOp> ArrowFunctionToPageOp(const std::string& fn) {
+  if (fn == "equal") return parquet::PredicateOp::EQ;
+  if (fn == "greater") return parquet::PredicateOp::GT;
+  if (fn == "greater_equal") return parquet::PredicateOp::GTE;
+  if (fn == "less") return parquet::PredicateOp::LT;
+  if (fn == "less_equal") return parquet::PredicateOp::LTE;
+  if (fn == "is_null") return parquet::PredicateOp::IS_NULL;
+  if (fn == "is_valid") return parquet::PredicateOp::IS_NOT_NULL;
+  return std::nullopt;
+}
+
+/// Attempt to extract a scalar value from an Arrow Scalar as a std::any whose
+/// C++ type matches the *Parquet physical type* of @p target_col.  This is
+/// required because ComputePageSelection performs a typeid() check on the
+/// std::any value, so storing INT8/INT16/INT32 values as int64_t would cause a
+/// type mismatch for any column whose Parquet physical type is INT32.
+///
+/// Returns an error Status for combinations that cannot be represented, or
+/// Status::NotImplemented for unsupported Arrow types.
+arrow::Result<std::any> ScalarToAny(const Scalar& scalar,
+                                    const parquet::ColumnDescriptor* target_col) {
+  if (!scalar.is_valid) return std::any{};
+
+  const parquet::Type::type parquet_phys = target_col->physical_type();
+
+  switch (scalar.type->id()) {
+    case Type::BOOL:
+      if (parquet_phys != parquet::Type::BOOLEAN) {
+        return Status::TypeError("Cannot compare BOOL scalar to Parquet column of type ",
+                                 parquet::TypeToString(parquet_phys));
+      }
+      return std::any{checked_cast<const BooleanScalar&>(scalar).value};
+
+    case Type::INT8:
+    case Type::INT16:
+    case Type::INT32: {
+      // Arrow INT8/INT16/INT32 scalars all carry an int32_t-range value; select
+      // the C++ type to match the Parquet physical type so typeid() succeeds.
+      int32_t v32;
+      if (scalar.type->id() == Type::INT8)
+        v32 = static_cast<int32_t>(checked_cast<const Int8Scalar&>(scalar).value);
+      else if (scalar.type->id() == Type::INT16)
+        v32 = static_cast<int32_t>(checked_cast<const Int16Scalar&>(scalar).value);
+      else
+        v32 = checked_cast<const Int32Scalar&>(scalar).value;
+
+      if (parquet_phys == parquet::Type::INT32) return std::any{v32};
+      if (parquet_phys == parquet::Type::INT64)
+        return std::any{static_cast<int64_t>(v32)};
+      return Status::TypeError(
+          "Cannot compare INT8/INT16/INT32 scalar to Parquet column of type ",
+          parquet::TypeToString(parquet_phys));
+    }
+
+    case Type::INT64:
+      if (parquet_phys != parquet::Type::INT64) {
+        return Status::TypeError("Cannot compare INT64 scalar to Parquet column of type ",
+                                 parquet::TypeToString(parquet_phys));
+      }
+      return std::any{checked_cast<const Int64Scalar&>(scalar).value};
+
+    case Type::UINT8:
+    case Type::UINT16: {
+      // Small unsigned integers fit in INT32 physical columns.
+      uint32_t v32;
+      if (scalar.type->id() == Type::UINT8)
+        v32 = static_cast<uint32_t>(checked_cast<const UInt8Scalar&>(scalar).value);
+      else
+        v32 = static_cast<uint32_t>(checked_cast<const UInt16Scalar&>(scalar).value);
+
+      if (parquet_phys == parquet::Type::INT32)
+        return std::any{static_cast<int32_t>(v32)};
+      if (parquet_phys == parquet::Type::INT64)
+        return std::any{static_cast<int64_t>(v32)};
+      return Status::TypeError(
+          "Cannot compare UINT8/UINT16 scalar to Parquet column of type ",
+          parquet::TypeToString(parquet_phys));
+    }
+
+    case Type::UINT32: {
+      uint32_t v = checked_cast<const UInt32Scalar&>(scalar).value;
+      // INT32 physical columns store signed values; promote to INT64 when the
+      // value exceeds INT32_MAX to avoid silent truncation.
+      if (parquet_phys == parquet::Type::INT32) {
+        if (v > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+          return Status::TypeError(
+              "UINT32 value ", v,
+              " exceeds INT32_MAX; cannot fit in INT32 physical column");
+        }
+        return std::any{static_cast<int32_t>(v)};
+      }
+      if (parquet_phys == parquet::Type::INT64) return std::any{static_cast<int64_t>(v)};
+      return Status::TypeError("Cannot compare UINT32 scalar to Parquet column of type ",
+                               parquet::TypeToString(parquet_phys));
+    }
+
+    case Type::UINT64: {
+      uint64_t v = checked_cast<const UInt64Scalar&>(scalar).value;
+      if (parquet_phys == parquet::Type::INT64) return std::any{static_cast<int64_t>(v)};
+      return Status::TypeError("Cannot compare UINT64 scalar to Parquet column of type ",
+                               parquet::TypeToString(parquet_phys));
+    }
+
+    case Type::FLOAT:
+      if (parquet_phys != parquet::Type::FLOAT) {
+        return Status::TypeError("Cannot compare FLOAT scalar to Parquet column of type ",
+                                 parquet::TypeToString(parquet_phys));
+      }
+      return std::any{checked_cast<const FloatScalar&>(scalar).value};
+
+    case Type::DOUBLE:
+      if (parquet_phys != parquet::Type::DOUBLE) {
+        return Status::TypeError(
+            "Cannot compare DOUBLE scalar to Parquet column of type ",
+            parquet::TypeToString(parquet_phys));
+      }
+      return std::any{checked_cast<const DoubleScalar&>(scalar).value};
+
+    case Type::STRING:
+    case Type::LARGE_STRING:
+      if (parquet_phys != parquet::Type::BYTE_ARRAY) {
+        return Status::TypeError(
+            "Cannot compare STRING scalar to Parquet column of type ",
+            parquet::TypeToString(parquet_phys));
+      }
+      if (scalar.type->id() == Type::STRING)
+        return std::any{
+            std::string(checked_cast<const StringScalar&>(scalar).value->ToString())};
+      return std::any{
+          std::string(checked_cast<const LargeStringScalar&>(scalar).value->ToString())};
+
+    default:
+      return Status::NotImplemented("ScalarToAny: unsupported Arrow type ",
+                                    scalar.type->ToString());
+  }
+}
+
+/// Walk a compute::Expression tree (depth-first, AND-conjunction aware) and
+/// collect all leaf predicates that can be pushed down to the page-index API.
+///
+/// Supported forms:
+///   field_ref op literal  (both orderings; op in ==, <, <=, >, >=)
+///   is_null(field_ref)
+///   is_valid(field_ref)
+///   and_(left, right)      (recursed into)
+///
+/// Composition model: the extracted leaves form an implicit conjunction (AND).
+/// Each leaf is evaluated independently by ComputePageSelection(), and the
+/// per-column RowSelections are combined with RowSelection::Intersect() by the
+/// caller (ComputePageSelections). This covers the common
+/// "col_a > x AND col_b == y AND ..." filter shape.
+///
+/// Deliberately NOT handled (safe over-selection — never wrong, just less
+/// pruning):
+///   - OR / or_kleene: an OR branch is ignored rather than combined via
+///     RowSelection::Union(). Ignoring it can only *retain* pages that a full
+///     evaluation might have dropped, so results stay correct; the post-scan
+///     filter removes any surplus rows. Wiring Union() through a tree-shaped
+///     combiner is left as a follow-up.
+///   - NOT / negation, and any non-comparison function.
+/// In all unsupported cases the offending sub-expression is silently skipped,
+/// which is safe: page pruning is an optimization, and the exact predicate is
+/// always re-applied by the scanner after reading.
+///
+/// @p parquet_schema is used to look up each column's Parquet physical type so
+/// that ScalarToAny() can produce a std::any value whose C++ type matches what
+/// ComputePageSelection() expects.
+void ExtractLeafPredicates(const compute::Expression& expr,
+                           const SchemaManifest& manifest, const Schema& physical_schema,
+                           const parquet::SchemaDescriptor& parquet_schema,
+                           std::vector<LeafPredicate>* out) {
+  const auto* call = expr.call();
+  if (!call) return;
+
+  // Recurse into AND conjunctions.
+  if (call->function_name == "and" || call->function_name == "and_kleene") {
+    for (const auto& arg : call->arguments) {
+      ExtractLeafPredicates(arg, manifest, physical_schema, parquet_schema, out);
+    }
+    return;
+  }
+
+  // is_null / is_valid take a single field_ref argument.
+  auto maybe_op = ArrowFunctionToPageOp(call->function_name);
+  if (!maybe_op) return;
+
+  if (call->function_name == "is_null" || call->function_name == "is_valid") {
+    if (call->arguments.size() != 1) return;
+    const auto* ref = call->arguments[0].field_ref();
+    if (!ref) return;
+    auto match = ref->FindOneOrNone(physical_schema);
+    if (!match.ok() || match.ValueUnsafe().empty()) return;
+    const SchemaField* schema_field = &manifest.schema_fields[match.ValueUnsafe()[0]];
+    if (!schema_field->is_leaf()) return;
+    out->push_back({schema_field->column_index, *maybe_op, {}});
+    return;
+  }
+
+  // Binary comparison: expects exactly two arguments.
+  if (call->arguments.size() != 2) return;
+
+  // Try both orderings: (field_ref, literal) and (literal, field_ref).
+  const compute::Expression* field_expr = nullptr;
+  const compute::Expression* literal_expr = nullptr;
+  parquet::PredicateOp op = *maybe_op;
+
+  if (call->arguments[0].field_ref() && call->arguments[1].literal()) {
+    field_expr = &call->arguments[0];
+    literal_expr = &call->arguments[1];
+  } else if (call->arguments[1].field_ref() && call->arguments[0].literal()) {
+    // Flip the field/literal order: invert the comparison direction.
+    field_expr = &call->arguments[1];
+    literal_expr = &call->arguments[0];
+    // Invert: e.g. 5 > col  =>  col < 5
+    if (op == parquet::PredicateOp::GT)
+      op = parquet::PredicateOp::LT;
+    else if (op == parquet::PredicateOp::LT)
+      op = parquet::PredicateOp::GT;
+    else if (op == parquet::PredicateOp::GTE)
+      op = parquet::PredicateOp::LTE;
+    else if (op == parquet::PredicateOp::LTE)
+      op = parquet::PredicateOp::GTE;
+    // EQ is symmetric, no inversion needed.
+  } else {
+    return;
+  }
+
+  const auto* ref = field_expr->field_ref();
+  if (!ref) return;
+  auto match = ref->FindOneOrNone(physical_schema);
+  if (!match.ok() || match.ValueUnsafe().empty()) return;
+  const SchemaField* schema_field = &manifest.schema_fields[match.ValueUnsafe()[0]];
+  if (!schema_field->is_leaf()) return;
+
+  const Datum* datum = literal_expr->literal();
+  if (!datum || !datum->is_scalar()) return;
+
+  // Look up the Parquet physical type for this column so that ScalarToAny can
+  // produce a std::any value whose C++ type matches ComputePageSelection's
+  // typeid() check.
+  int col_idx = schema_field->column_index;
+  if (col_idx < 0 || col_idx >= parquet_schema.num_columns()) return;
+  const parquet::ColumnDescriptor* col_desc = parquet_schema.Column(col_idx);
+  if (!col_desc) return;
+
+  auto any_value_result = ScalarToAny(*datum->scalar(), col_desc);
+  if (!any_value_result.ok()) {
+    // The scalar type is incompatible with the Parquet physical type (e.g.
+    // string vs INT32).  Skip this predicate rather than silently corrupting
+    // page pruning.
+    ARROW_LOG(WARNING) << "ScalarToAny failed for column " << col_idx << ": "
+                       << any_value_result.status().message();
+    return;
+  }
+  std::any val = std::move(any_value_result).ValueUnsafe();
+  if (!val.has_value()) return;
+
+  out->push_back({col_idx, op, std::move(val)});
+}
+
+}  // namespace
+
+Status ParquetFileFragment::ComputePageSelections(const compute::Expression& predicate,
+                                                  parquet::arrow::FileReader* reader) {
+  DCHECK_NE(reader, nullptr);
+  DCHECK_NE(metadata_, nullptr);
+
+  // Re-use the lock to safely read manifest_ / row_groups_.
+  auto lock = physical_schema_mutex_.Lock();
+
+  // Configure the page-index policy on the underlying ParquetFileReader so that
+  // ComputePageSelection() honours the caller's settings.
+  parquet::ParquetFileReader* parquet_reader = reader->parquet_reader();
+  parquet_reader->set_arrow_reader_properties(reader->properties());
+
+  const parquet::PageIndexPolicy policy = reader->properties().page_index_policy();
+
+  if (policy == parquet::PageIndexPolicy::NEVER) {
+    // Page pruning disabled; leave page_selections_ empty.
+    return Status::OK();
+  }
+
+  // Simplify the predicate against the partition expression before extracting leaves.
+  auto simplified = predicate;
+  auto simplify_result =
+      SimplifyWithGuarantee(std::move(simplified), partition_expression_);
+  if (!simplify_result.ok()) {
+    // Non-fatal: fall back to no page pruning.
+    return Status::OK();
+  }
+  simplified = std::move(simplify_result).ValueUnsafe();
+  if (!simplified.IsSatisfiable()) {
+    // Predicate is already unsatisfiable; no rows to select.
+    return Status::OK();
+  }
+
+  // Extract individual leaf predicates from the (possibly compound) filter.
+  // Pass the Parquet file schema so ScalarToAny() can match the physical type
+  // of each column and produce a std::any with the correct C++ type.
+  const parquet::SchemaDescriptor* parquet_schema = parquet_reader->metadata()->schema();
+  DCHECK_NE(parquet_schema, nullptr);
+  std::vector<LeafPredicate> leaf_predicates;
+  ExtractLeafPredicates(simplified, *manifest_, *physical_schema_, *parquet_schema,
+                        &leaf_predicates);
+
+  if (leaf_predicates.empty()) {
+    // No pushdown-able predicates found; leave page_selections_ empty.
+    return Status::OK();
+  }
+
+  // For each leaf predicate, call ComputePageSelection across the surviving
+  // row groups, then intersect the results per row group.
+  //
+  // page_selections_[rg] holds the intersection of all per-column selections.
+  // A missing entry means "select all" for that row group.
+  std::map<int, std::shared_ptr<parquet::RowSelection>> merged;
+
+  for (const auto& leaf : leaf_predicates) {
+    std::map<int, std::shared_ptr<parquet::RowSelection>> per_col;
+
+    if (policy == parquet::PageIndexPolicy::ALWAYS) {
+      // ALWAYS: propagate errors back to the caller.
+      ARROW_ASSIGN_OR_RAISE(per_col, parquet_reader->ComputePageSelection(
+                                         leaf.column_index, leaf.op, leaf.value,
+                                         row_groups_ ? &(*row_groups_) : nullptr));
+    } else {
+      // AUTO: swallow errors (e.g. absent page index) and fall back.
+      auto result =
+          parquet_reader->ComputePageSelection(leaf.column_index, leaf.op, leaf.value,
+                                               row_groups_ ? &(*row_groups_) : nullptr);
+      if (!result.ok()) {
+        ARROW_LOG(WARNING) << "ComputePageSelection failed for column "
+                           << leaf.column_index << " (op="
+                           << static_cast<int>(leaf.op)
+                           << "); falling back to row-group pruning: "
+                           << result.status().message();
+        continue;
+      }
+      per_col = std::move(result).ValueUnsafe();
+    }
+
+    // Intersect per_col into merged (AND semantics).
+    for (auto& [rg_idx, sel] : per_col) {
+      if (!sel) continue;
+      auto it = merged.find(rg_idx);
+      if (it == merged.end()) {
+        merged[rg_idx] = sel;
+      } else {
+        auto intersected = it->second->Intersect(*sel);
+        if (!intersected.ok()) {
+          // Incompatible row counts — skip this intersection.
+          ARROW_LOG(WARNING) << "RowSelection::Intersect failed for row group " << rg_idx
+                             << ": " << intersected.status().message();
+          continue;
+        }
+        it->second =
+            std::make_shared<parquet::RowSelection>(std::move(intersected).ValueUnsafe());
+      }
+    }
+  }
+
+  page_selections_ = std::move(merged);
+  return Status::OK();
 }
 
 //
