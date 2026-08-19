@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <any>
 #include <limits>
 #include <numeric>
 
 #include "arrow/io/interfaces.h"
 #include "arrow/result.h"
+#include "arrow/scalar.h"
 #include "arrow/status.h"
+#include "arrow/util/checked_cast.h"
 #include "arrow/util/int_util_overflow.h"
 #include "arrow/util/logging_internal.h"
 #include "arrow/util/unreachable.h"
@@ -40,6 +41,8 @@
 namespace parquet {
 
 namespace {
+
+using ::arrow::internal::checked_cast;
 
 template <typename DType>
 void Decode(std::unique_ptr<typename EncodingTraits<DType>::Decoder>& decoder,
@@ -89,6 +92,172 @@ void Decode<ByteArrayType>(std::unique_ptr<ByteArrayDecoder>&, const std::string
 
   output->at(output_index) = {/*len=*/static_cast<uint32_t>(input.size()),
                               /*ptr=*/reinterpret_cast<const uint8_t*>(input.data())};
+}
+
+// Extract the Parquet physical value of type `T` (for column type `DType`) from
+// an Arrow Scalar, applying the same cross-type compatibility rules the dataset
+// layer previously encoded in ScalarToAny(): integer scalars may narrow/widen to
+// the column's physical width, but incompatible categories (e.g. STRING vs
+// INT32) are rejected. The returned value may reference memory owned by
+// `scalar` (for BYTE_ARRAY / FLBA), so it must not outlive the scalar.
+template <typename DType>
+::arrow::Result<typename DType::c_type> ExtractScalarValue(const ::arrow::Scalar& scalar,
+                                                           const ColumnDescriptor* descr);
+
+template <>
+::arrow::Result<bool> ExtractScalarValue<BooleanType>(const ::arrow::Scalar& scalar,
+                                                      const ColumnDescriptor*) {
+  if (scalar.type->id() != ::arrow::Type::BOOL) {
+    return ::arrow::Status::TypeError("Cannot compare ", scalar.type->ToString(),
+                                      " scalar to Parquet BOOLEAN column");
+  }
+  return checked_cast<const ::arrow::BooleanScalar&>(scalar).value;
+}
+
+template <>
+::arrow::Result<int32_t> ExtractScalarValue<Int32Type>(const ::arrow::Scalar& scalar,
+                                                       const ColumnDescriptor*) {
+  switch (scalar.type->id()) {
+    case ::arrow::Type::INT8:
+      return static_cast<int32_t>(checked_cast<const ::arrow::Int8Scalar&>(scalar).value);
+    case ::arrow::Type::INT16:
+      return static_cast<int32_t>(
+          checked_cast<const ::arrow::Int16Scalar&>(scalar).value);
+    case ::arrow::Type::INT32:
+      return checked_cast<const ::arrow::Int32Scalar&>(scalar).value;
+    case ::arrow::Type::UINT8:
+      return static_cast<int32_t>(
+          checked_cast<const ::arrow::UInt8Scalar&>(scalar).value);
+    case ::arrow::Type::UINT16:
+      return static_cast<int32_t>(
+          checked_cast<const ::arrow::UInt16Scalar&>(scalar).value);
+    case ::arrow::Type::UINT32: {
+      uint32_t v = checked_cast<const ::arrow::UInt32Scalar&>(scalar).value;
+      if (v > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+        return ::arrow::Status::TypeError(
+            "UINT32 value ", v, " exceeds INT32_MAX; cannot fit in INT32 column");
+      }
+      return static_cast<int32_t>(v);
+    }
+    default:
+      return ::arrow::Status::TypeError("Cannot compare ", scalar.type->ToString(),
+                                        " scalar to Parquet INT32 column");
+  }
+}
+
+template <>
+::arrow::Result<int64_t> ExtractScalarValue<Int64Type>(const ::arrow::Scalar& scalar,
+                                                       const ColumnDescriptor*) {
+  switch (scalar.type->id()) {
+    case ::arrow::Type::INT8:
+      return static_cast<int64_t>(checked_cast<const ::arrow::Int8Scalar&>(scalar).value);
+    case ::arrow::Type::INT16:
+      return static_cast<int64_t>(
+          checked_cast<const ::arrow::Int16Scalar&>(scalar).value);
+    case ::arrow::Type::INT32:
+      return static_cast<int64_t>(
+          checked_cast<const ::arrow::Int32Scalar&>(scalar).value);
+    case ::arrow::Type::INT64:
+      return checked_cast<const ::arrow::Int64Scalar&>(scalar).value;
+    case ::arrow::Type::UINT8:
+      return static_cast<int64_t>(
+          checked_cast<const ::arrow::UInt8Scalar&>(scalar).value);
+    case ::arrow::Type::UINT16:
+      return static_cast<int64_t>(
+          checked_cast<const ::arrow::UInt16Scalar&>(scalar).value);
+    case ::arrow::Type::UINT32:
+      return static_cast<int64_t>(
+          checked_cast<const ::arrow::UInt32Scalar&>(scalar).value);
+    case ::arrow::Type::UINT64: {
+      uint64_t v = checked_cast<const ::arrow::UInt64Scalar&>(scalar).value;
+      if (v > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return ::arrow::Status::TypeError(
+            "UINT64 value ", v, " exceeds INT64_MAX; cannot fit in INT64 column");
+      }
+      return static_cast<int64_t>(v);
+    }
+    default:
+      return ::arrow::Status::TypeError("Cannot compare ", scalar.type->ToString(),
+                                        " scalar to Parquet INT64 column");
+  }
+}
+
+template <>
+::arrow::Result<float> ExtractScalarValue<FloatType>(const ::arrow::Scalar& scalar,
+                                                     const ColumnDescriptor*) {
+  if (scalar.type->id() != ::arrow::Type::FLOAT) {
+    return ::arrow::Status::TypeError("Cannot compare ", scalar.type->ToString(),
+                                      " scalar to Parquet FLOAT column");
+  }
+  return checked_cast<const ::arrow::FloatScalar&>(scalar).value;
+}
+
+template <>
+::arrow::Result<double> ExtractScalarValue<DoubleType>(const ::arrow::Scalar& scalar,
+                                                       const ColumnDescriptor*) {
+  if (scalar.type->id() != ::arrow::Type::DOUBLE) {
+    return ::arrow::Status::TypeError("Cannot compare ", scalar.type->ToString(),
+                                      " scalar to Parquet DOUBLE column");
+  }
+  return checked_cast<const ::arrow::DoubleScalar&>(scalar).value;
+}
+
+template <>
+::arrow::Result<ByteArray> ExtractScalarValue<ByteArrayType>(
+    const ::arrow::Scalar& scalar, const ColumnDescriptor*) {
+  const ::arrow::Buffer* buffer = nullptr;
+  switch (scalar.type->id()) {
+    case ::arrow::Type::STRING:
+    case ::arrow::Type::BINARY:
+      buffer = checked_cast<const ::arrow::BaseBinaryScalar&>(scalar).value.get();
+      break;
+    case ::arrow::Type::LARGE_STRING:
+    case ::arrow::Type::LARGE_BINARY:
+      buffer = checked_cast<const ::arrow::BaseBinaryScalar&>(scalar).value.get();
+      break;
+    default:
+      return ::arrow::Status::TypeError("Cannot compare ", scalar.type->ToString(),
+                                        " scalar to Parquet BYTE_ARRAY column");
+  }
+  if (buffer == nullptr) {
+    return ::arrow::Status::TypeError("Null buffer in BYTE_ARRAY scalar");
+  }
+  if (buffer->size() > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    return ::arrow::Status::TypeError("BYTE_ARRAY scalar exceeds uint32 length");
+  }
+  return ByteArray(static_cast<uint32_t>(buffer->size()), buffer->data());
+}
+
+template <>
+::arrow::Result<FLBA> ExtractScalarValue<FLBAType>(const ::arrow::Scalar& scalar,
+                                                   const ColumnDescriptor* descr) {
+  const ::arrow::Buffer* buffer = nullptr;
+  switch (scalar.type->id()) {
+    case ::arrow::Type::FIXED_SIZE_BINARY:
+    case ::arrow::Type::BINARY:
+    case ::arrow::Type::STRING:
+      buffer = checked_cast<const ::arrow::BaseBinaryScalar&>(scalar).value.get();
+      break;
+    default:
+      return ::arrow::Status::TypeError("Cannot compare ", scalar.type->ToString(),
+                                        " scalar to Parquet FIXED_LEN_BYTE_ARRAY column");
+  }
+  if (buffer == nullptr) {
+    return ::arrow::Status::TypeError("Null buffer in FIXED_LEN_BYTE_ARRAY scalar");
+  }
+  if (buffer->size() != descr->type_length()) {
+    return ::arrow::Status::TypeError(
+        "FIXED_LEN_BYTE_ARRAY scalar length ", buffer->size(),
+        " does not match column type_length ", descr->type_length());
+  }
+  return FLBA(buffer->data());
+}
+
+template <>
+::arrow::Result<Int96> ExtractScalarValue<Int96Type>(const ::arrow::Scalar&,
+                                                     const ColumnDescriptor*) {
+  return ::arrow::Status::NotImplemented(
+      "FilterPages: INT96 columns have no defined sort order");
 }
 
 template <typename DType>
@@ -180,18 +349,15 @@ class TypedColumnIndexImpl : public TypedColumnIndex<DType> {
     return column_index_.repetition_level_histograms;
   }
 
-  ::arrow::Result<RowSelection> FilterPages(const std::any& predicate_value,
+  ::arrow::Result<RowSelection> FilterPages(const ::arrow::Scalar& predicate_value,
                                             PredicateOp op,
                                             const OffsetIndex& offset_index,
                                             int64_t row_group_row_count) const override {
     // Extract the typed predicate value (not needed for null operators).
     T typed_value{};
     if (op != PredicateOp::IS_NULL && op != PredicateOp::IS_NOT_NULL) {
-      if (predicate_value.type() != typeid(T)) {
-        return ::arrow::Status::TypeError(
-            "FilterPages: predicate value type does not match column physical type");
-      }
-      typed_value = std::any_cast<T>(predicate_value);
+      ARROW_ASSIGN_OR_RAISE(typed_value,
+                            ExtractScalarValue<DType>(predicate_value, descr_));
     }
 
     // Build a comparator for this column's physical type and sort order.

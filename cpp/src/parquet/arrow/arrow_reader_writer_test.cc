@@ -6273,8 +6273,9 @@ TEST_F(TestArrowParquetPagePruning, MultiRGAlwaysPredicateRG1) {
   props.set_page_index_policy(::parquet::PageIndexPolicy::ALWAYS);
   pq_reader->set_arrow_reader_properties(props);
 
-  ASSERT_OK_AND_ASSIGN(auto sel_map, pq_reader->ComputePageSelection(
-                                         /*col=*/0, PredicateOp::GT, std::any(threshold)));
+  ASSERT_OK_AND_ASSIGN(auto sel_map,
+                       pq_reader->ComputePageSelection(
+                           /*col=*/0, PredicateOp::GT, ::arrow::Int32Scalar(threshold)));
 
   // Read pruned values.
   auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, /*col=*/0);
@@ -6320,8 +6321,9 @@ TEST_F(TestArrowParquetPagePruning, NeverPolicyReturnsAll) {
   auto pq_reader = ::parquet::ParquetFileReader::Open(in_file);
   pq_reader->set_arrow_reader_properties(props);
 
-  ASSERT_OK_AND_ASSIGN(auto sel_map,
-                       pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{50})));
+  ASSERT_OK_AND_ASSIGN(
+      auto sel_map, pq_reader->ComputePageSelection(0, PredicateOp::GT,
+                                                    ::arrow::Int32Scalar(int32_t{50})));
 
   for (const auto& [rg_idx, sel] : sel_map) {
     int64_t num_rows = pq_reader->metadata()->RowGroup(rg_idx)->num_rows();
@@ -6351,7 +6353,8 @@ TEST_F(TestArrowParquetPagePruning, PredicateMatchesNone) {
   pq_reader->set_arrow_reader_properties(props);
 
   ASSERT_OK_AND_ASSIGN(auto sel_map,
-                       pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(threshold)));
+                       pq_reader->ComputePageSelection(0, PredicateOp::GT,
+                                                       ::arrow::Int32Scalar(threshold)));
 
   auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
   EXPECT_EQ(pruned_arr->length(), 0);
@@ -6372,7 +6375,8 @@ TEST_F(TestArrowParquetPagePruning, PredicateMatchesAll) {
   pq_reader->set_arrow_reader_properties(props);
 
   ASSERT_OK_AND_ASSIGN(auto sel_map,
-                       pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(threshold)));
+                       pq_reader->ComputePageSelection(0, PredicateOp::GT,
+                                                       ::arrow::Int32Scalar(threshold)));
 
   auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
   // Every row satisfies value > 0, so all 100 rows should be returned.
@@ -6438,8 +6442,9 @@ TEST_F(TestArrowParquetPagePruning, AlwaysReadsFewerBytes) {
 
     // Compute the per-row-group selection via the predicate, then read each
     // row group through the sparse I/O path.
-    ASSERT_OK_AND_ASSIGN(auto sel_map, reader->parquet_reader()->ComputePageSelection(
-                                           0, PredicateOp::GT, std::any(threshold)));
+    ASSERT_OK_AND_ASSIGN(auto sel_map,
+                         reader->parquet_reader()->ComputePageSelection(
+                             0, PredicateOp::GT, ::arrow::Int32Scalar(threshold)));
     const std::vector<int> cols{0};
     for (const auto& [rg, sel] : sel_map) {
       ASSERT_OK_AND_ASSIGN(auto table,
@@ -6482,7 +6487,8 @@ TEST_F(TestArrowParquetPagePruning, NoIndexFallback) {
   props.set_page_index_policy(::parquet::PageIndexPolicy::ALWAYS);
   pq_reader->set_arrow_reader_properties(props);
 
-  auto result = pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{5}));
+  auto result = pq_reader->ComputePageSelection(0, PredicateOp::GT,
+                                                ::arrow::Int32Scalar(int32_t{5}));
   EXPECT_FALSE(result.ok());
   EXPECT_TRUE(result.status().IsInvalid());
 
@@ -6493,8 +6499,9 @@ TEST_F(TestArrowParquetPagePruning, NoIndexFallback) {
   props_auto.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
   pq_reader2->set_arrow_reader_properties(props_auto);
 
-  ASSERT_OK_AND_ASSIGN(auto sel_map,
-                       pq_reader2->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{5})));
+  ASSERT_OK_AND_ASSIGN(
+      auto sel_map, pq_reader2->ComputePageSelection(0, PredicateOp::GT,
+                                                     ::arrow::Int32Scalar(int32_t{5})));
   // AUTO fallback: all 10 rows should be selected.
   auto pruned_arr = ReadSelectedInt32Values(pq_reader2.get(), sel_map, 0);
   EXPECT_EQ(pruned_arr->length(), 10);
@@ -6523,8 +6530,9 @@ TEST_F(TestArrowParquetPagePruning, SingleRGSinglePageMatch) {
     props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
     pq_reader->set_arrow_reader_properties(props);
 
-    ASSERT_OK_AND_ASSIGN(auto sel_map,
-                         pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{3})));
+    ASSERT_OK_AND_ASSIGN(
+        auto sel_map, pq_reader->ComputePageSelection(0, PredicateOp::GT,
+                                                      ::arrow::Int32Scalar(int32_t{3})));
     auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
     // Single page has values 1-5 which does contain values >3 so page is selected.
     EXPECT_GT(pruned_arr->length(), 0);
@@ -6538,8 +6546,9 @@ TEST_F(TestArrowParquetPagePruning, SingleRGSinglePageMatch) {
     props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
     pq_reader->set_arrow_reader_properties(props);
 
-    ASSERT_OK_AND_ASSIGN(
-        auto sel_map, pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{100})));
+    ASSERT_OK_AND_ASSIGN(auto sel_map,
+                         pq_reader->ComputePageSelection(
+                             0, PredicateOp::GT, ::arrow::Int32Scalar(int32_t{100})));
     auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
     // No value in [1,5] is > 100: the page should be skipped → 0 rows.
     EXPECT_EQ(pruned_arr->length(), 0);
@@ -6573,7 +6582,8 @@ TEST_F(TestArrowParquetPagePruning, AllNullRGSkipped) {
 
   // Predicate "value > 0" can never match a null, so the whole RG should be skipped.
   ASSERT_OK_AND_ASSIGN(auto sel_map,
-                       pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{0})));
+                       pq_reader->ComputePageSelection(0, PredicateOp::GT,
+                                                       ::arrow::Int32Scalar(int32_t{0})));
 
   // Verify the selection skips everything.
   ASSERT_EQ(static_cast<int>(sel_map.size()), 1);
@@ -6614,8 +6624,9 @@ TEST_F(TestArrowParquetPagePruning, SingleRowSinglePageMatch) {
     props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
     pq_reader->set_arrow_reader_properties(props);
 
-    ASSERT_OK_AND_ASSIGN(auto sel_map,
-                         pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{10})));
+    ASSERT_OK_AND_ASSIGN(
+        auto sel_map, pq_reader->ComputePageSelection(0, PredicateOp::GT,
+                                                      ::arrow::Int32Scalar(int32_t{10})));
     auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
     EXPECT_EQ(pruned_arr->length(), 1);
     auto typed = std::dynamic_pointer_cast<::arrow::Int32Array>(pruned_arr);
@@ -6631,8 +6642,9 @@ TEST_F(TestArrowParquetPagePruning, SingleRowSinglePageMatch) {
     props.set_page_index_policy(::parquet::PageIndexPolicy::AUTO);
     pq_reader->set_arrow_reader_properties(props);
 
-    ASSERT_OK_AND_ASSIGN(
-        auto sel_map, pq_reader->ComputePageSelection(0, PredicateOp::GT, std::any(int32_t{100})));
+    ASSERT_OK_AND_ASSIGN(auto sel_map,
+                         pq_reader->ComputePageSelection(
+                             0, PredicateOp::GT, ::arrow::Int32Scalar(int32_t{100})));
     auto pruned_arr = ReadSelectedInt32Values(pq_reader.get(), sel_map, 0);
     EXPECT_EQ(pruned_arr->length(), 0);
   }

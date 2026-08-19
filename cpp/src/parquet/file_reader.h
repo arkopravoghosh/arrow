@@ -17,7 +17,6 @@
 
 #pragma once
 
-#include <any>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -26,6 +25,7 @@
 
 #include "arrow/io/caching.h"
 #include "arrow/result.h"
+#include "arrow/type_fwd.h"
 #include "arrow/util/type_fwd.h"
 #include "parquet/metadata.h"  // IWYU pragma: keep
 #include "parquet/platform.h"
@@ -301,9 +301,9 @@ class PARQUET_EXPORT ParquetFileReader {
   ///
   /// \param column_index  Physical column index (0-based).
   /// \param op            Predicate operator (see PredicateOp).
-  /// \param predicate_value  Scalar value to compare against (type must match
-  ///                         the column's physical type; ignored for IS_NULL /
-  ///                         IS_NOT_NULL).
+  /// \param predicate_value  Scalar value to compare against.  Its type must be
+  ///                         convertible to the column's physical type; ignored
+  ///                         for IS_NULL / IS_NOT_NULL.
   /// \param row_group_indices  Optional list of row-group indices to filter.
   ///                           Pass nullptr or an empty vector to use all row
   ///                           groups.
@@ -313,7 +313,7 @@ class PARQUET_EXPORT ParquetFileReader {
   ///
   /// \note API EXPERIMENTAL
   ::arrow::Result<std::map<int, std::shared_ptr<RowSelection>>> ComputePageSelection(
-      int column_index, PredicateOp op, const std::any& predicate_value,
+      int column_index, PredicateOp op, const ::arrow::Scalar& predicate_value,
       const std::vector<int>* row_group_indices = nullptr) const;
 
   /// \brief Construct a RecordReader with optional row selection for page-level
@@ -327,10 +327,12 @@ class PARQUET_EXPORT ParquetFileReader {
   ///
   /// Typical usage:
   /// \code{.cpp}
-  ///   auto selections = reader->ComputePageSelection(col, PredicateOp::GT,
-  ///                                                  std::any(int32_t(50))).ValueOrDie();
+  ///   ARROW_ASSIGN_OR_RAISE(auto selections,
+  ///       reader->ComputePageSelection(col, PredicateOp::GT,
+  ///                                    ::arrow::Int32Scalar(50)));
   ///   for (auto& [rg, sel] : selections) {
-  ///     auto record_reader = reader->GetRecordReader(rg, col, sel).ValueOrDie();
+  ///     ARROW_ASSIGN_OR_RAISE(auto record_reader,
+  ///                           reader->GetRecordReader(rg, col, sel));
   ///     // read batches from record_reader ...
   ///   }
   /// \endcode

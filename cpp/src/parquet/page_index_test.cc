@@ -21,6 +21,7 @@
 #include <memory>
 
 #include "arrow/io/file.h"
+#include "arrow/scalar.h"
 #include "arrow/util/float16.h"
 #include "parquet/file_reader.h"
 #include "parquet/metadata.h"
@@ -1043,6 +1044,40 @@ std::string EncodePlainValue<FLBAType>(FLBA value, const ColumnDescriptor* descr
 // instead.
 // ---------------------------------------------------------------------------
 
+// Convert a Parquet physical value of type `TestType::c_type` into an Arrow
+// Scalar whose Arrow type maps to the same physical type, so it can be passed
+// to ColumnIndex::FilterPages().
+template <typename TestType>
+std::shared_ptr<::arrow::Scalar> PhysicalToScalar(const typename TestType::c_type& value,
+                                                  const ColumnDescriptor* descr) {
+  using T = typename TestType::c_type;
+  if constexpr (std::is_same_v<TestType, BooleanType>) {
+    return std::make_shared<::arrow::BooleanScalar>(value);
+  } else if constexpr (std::is_same_v<TestType, Int32Type>) {
+    return std::make_shared<::arrow::Int32Scalar>(value);
+  } else if constexpr (std::is_same_v<TestType, Int64Type>) {
+    return std::make_shared<::arrow::Int64Scalar>(value);
+  } else if constexpr (std::is_same_v<TestType, FloatType>) {
+    return std::make_shared<::arrow::FloatScalar>(value);
+  } else if constexpr (std::is_same_v<TestType, DoubleType>) {
+    return std::make_shared<::arrow::DoubleScalar>(value);
+  } else if constexpr (std::is_same_v<TestType, ByteArrayType>) {
+    return std::make_shared<::arrow::BinaryScalar>(
+        std::string(reinterpret_cast<const char*>(value.ptr), value.len));
+  } else if constexpr (std::is_same_v<TestType, FLBAType>) {
+    int len = descr->type_length();
+    auto buf = ::arrow::Buffer::FromString(
+        std::string(reinterpret_cast<const char*>(value.ptr), len));
+    return std::make_shared<::arrow::FixedSizeBinaryScalar>(
+        std::move(buf), ::arrow::fixed_size_binary(len));
+  } else {
+    // Int96 and any unsupported type: no meaningful Scalar mapping.
+    (void)value;
+    (void)descr;
+    return std::make_shared<::arrow::NullScalar>();
+  }
+}
+
 template <typename TestType>
 class TestColumnIndexFilterPages : public test::PrimitiveTypedTest<TestType> {
  public:
@@ -1089,49 +1124,50 @@ TYPED_TEST_SUITE(TestColumnIndexFilterPages, test::ParquetTypes);
 // parametrized sweep pass trivially.
 // ---------------------------------------------------------------------------
 TYPED_TEST(TestColumnIndexFilterPages, Int32Predicate15) {
-  if constexpr (!std::is_same_v<TypeParam, Int32Type>) {
+  if constexpr (std::is_same_v<TypeParam, Int32Type>) {
+    // Three pages: [1,10], [11,20], [21,30].
+    auto node = schema::Int32("col");
+    std::vector<EncodedStatistics> page_stats(3);
+    auto encode = [](int32_t v) {
+      return std::string(reinterpret_cast<const char*>(&v), sizeof(int32_t));
+    };
+    page_stats[0].set_min(encode(1)).set_max(encode(10)).set_null_count(0);
+    page_stats[1].set_min(encode(11)).set_max(encode(20)).set_null_count(0);
+    page_stats[2].set_min(encode(21)).set_max(encode(30)).set_null_count(0);
+
+    auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+    ASSERT_NE(nullptr, col_index);
+
+    // OffsetIndex: 3 pages, first_row_index = 0, 100, 200; total rows = 300.
+    std::vector<PageLocation> page_locs = {
+        {/*offset=*/0, /*size=*/100, /*first_row=*/0},
+        {/*offset=*/100, /*size=*/100, /*first_row=*/100},
+        {/*offset=*/200, /*size=*/100, /*first_row=*/200},
+    };
+    auto off_index = BuildOffsetIndex(page_locs);
+    ASSERT_NE(nullptr, off_index);
+
+    // EQ predicate for value=15 should skip pages 0 ([1,10]) and 2 ([21,30]),
+    // and select page 1 ([11,20]).
+    int32_t pred_value = 15;
+    PARQUET_ASSIGN_OR_THROW(
+        auto selection,
+        col_index->FilterPages(*PhysicalToScalar<TypeParam>(pred_value, col_descr.get()),
+                               PredicateOp::EQ, *off_index,
+                               /*row_group_row_count=*/300));
+
+    ASSERT_EQ(3, selection.page_count());
+    EXPECT_TRUE(selection.selector(0).skip);   // page 0 [1,10]  – skip
+    EXPECT_FALSE(selection.selector(1).skip);  // page 1 [11,20] – select
+    EXPECT_TRUE(selection.selector(2).skip);   // page 2 [21,30] – skip
+
+    // Verify row counts derived from OffsetIndex.
+    EXPECT_EQ(100, selection.selector(0).row_count);
+    EXPECT_EQ(100, selection.selector(1).row_count);
+    EXPECT_EQ(100, selection.selector(2).row_count);
+  } else {
     GTEST_SKIP() << "Case 1 is Int32-specific; tested via AllTypes for other types";
   }
-
-  // Three pages: [1,10], [11,20], [21,30].
-  auto node = schema::Int32("col");
-  std::vector<EncodedStatistics> page_stats(3);
-  auto encode = [](int32_t v) {
-    return std::string(reinterpret_cast<const char*>(&v), sizeof(int32_t));
-  };
-  page_stats[0].set_min(encode(1)).set_max(encode(10)).set_null_count(0);
-  page_stats[1].set_min(encode(11)).set_max(encode(20)).set_null_count(0);
-  page_stats[2].set_min(encode(21)).set_max(encode(30)).set_null_count(0);
-
-  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
-  ASSERT_NE(nullptr, col_index);
-
-  // OffsetIndex: 3 pages, first_row_index = 0, 100, 200; total rows = 300.
-  std::vector<PageLocation> page_locs = {
-      {/*offset=*/0, /*size=*/100, /*first_row=*/0},
-      {/*offset=*/100, /*size=*/100, /*first_row=*/100},
-      {/*offset=*/200, /*size=*/100, /*first_row=*/200},
-  };
-  auto off_index = BuildOffsetIndex(page_locs);
-  ASSERT_NE(nullptr, off_index);
-
-  // EQ predicate for value=15 should skip pages 0 ([1,10]) and 2 ([21,30]),
-  // and select page 1 ([11,20]).
-  int32_t pred_value = 15;
-  PARQUET_ASSIGN_OR_THROW(
-      auto selection,
-      col_index->FilterPages(std::any(pred_value), PredicateOp::EQ, *off_index,
-                             /*row_group_row_count=*/300));
-
-  ASSERT_EQ(3, selection.page_count());
-  EXPECT_TRUE(selection.selector(0).skip);   // page 0 [1,10]  – skip
-  EXPECT_FALSE(selection.selector(1).skip);  // page 1 [11,20] – select
-  EXPECT_TRUE(selection.selector(2).skip);   // page 2 [21,30] – skip
-
-  // Verify row counts derived from OffsetIndex.
-  EXPECT_EQ(100, selection.selector(0).row_count);
-  EXPECT_EQ(100, selection.selector(1).row_count);
-  EXPECT_EQ(100, selection.selector(2).row_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,38 +1178,39 @@ TYPED_TEST(TestColumnIndexFilterPages, Int32Predicate15) {
 // Only runs substantively for FloatType.
 // ---------------------------------------------------------------------------
 TYPED_TEST(TestColumnIndexFilterPages, FloatPredicateGT) {
-  if constexpr (!std::is_same_v<TypeParam, FloatType>) {
+  if constexpr (std::is_same_v<TypeParam, FloatType>) {
+    auto encode_f = [](float v) {
+      return std::string(reinterpret_cast<const char*>(&v), sizeof(float));
+    };
+
+    auto node = schema::Float("col");
+    std::vector<EncodedStatistics> page_stats(2);
+    page_stats[0].set_min(encode_f(0.0f)).set_max(encode_f(5.0f)).set_null_count(0);
+    page_stats[1].set_min(encode_f(6.0f)).set_max(encode_f(10.0f)).set_null_count(0);
+
+    auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
+    ASSERT_NE(nullptr, col_index);
+
+    std::vector<PageLocation> page_locs = {
+        {0, 100, 0},
+        {100, 100, 50},
+    };
+    auto off_index = BuildOffsetIndex(page_locs);
+    ASSERT_NE(nullptr, off_index);
+
+    float pred_value = 7.0f;
+    PARQUET_ASSIGN_OR_THROW(
+        auto selection,
+        col_index->FilterPages(*PhysicalToScalar<TypeParam>(pred_value, col_descr.get()),
+                               PredicateOp::GT, *off_index,
+                               /*row_group_row_count=*/100));
+
+    ASSERT_EQ(2, selection.page_count());
+    EXPECT_TRUE(selection.selector(0).skip);   // page 0: max=5.0 < 7.0 → skip
+    EXPECT_FALSE(selection.selector(1).skip);  // page 1: max=10.0 >= 7.0 → select
+  } else {
     GTEST_SKIP() << "Case 2 is Float-specific; tested via AllTypes for other types";
   }
-
-  auto encode_f = [](float v) {
-    return std::string(reinterpret_cast<const char*>(&v), sizeof(float));
-  };
-
-  auto node = schema::Float("col");
-  std::vector<EncodedStatistics> page_stats(2);
-  page_stats[0].set_min(encode_f(0.0f)).set_max(encode_f(5.0f)).set_null_count(0);
-  page_stats[1].set_min(encode_f(6.0f)).set_max(encode_f(10.0f)).set_null_count(0);
-
-  auto [col_index, col_descr] = BuildColumnIndex(node, page_stats);
-  ASSERT_NE(nullptr, col_index);
-
-  std::vector<PageLocation> page_locs = {
-      {0, 100, 0},
-      {100, 100, 50},
-  };
-  auto off_index = BuildOffsetIndex(page_locs);
-  ASSERT_NE(nullptr, off_index);
-
-  float pred_value = 7.0f;
-  PARQUET_ASSIGN_OR_THROW(
-      auto selection,
-      col_index->FilterPages(std::any(pred_value), PredicateOp::GT, *off_index,
-                             /*row_group_row_count=*/100));
-
-  ASSERT_EQ(2, selection.page_count());
-  EXPECT_TRUE(selection.selector(0).skip);   // page 0: max=5.0 < 7.0 → skip
-  EXPECT_FALSE(selection.selector(1).skip);  // page 1: max=10.0 >= 7.0 → select
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,8 +1265,10 @@ TYPED_TEST(TestColumnIndexFilterPages, AllTypes) {
     // EQ true → only page 1 qualifies; page 2 is all-null → skipped by EQ.
     bool pred_val = true;
     PARQUET_ASSIGN_OR_THROW(
-        auto sel, col_index->FilterPages(std::any(pred_val), PredicateOp::EQ, *off_index,
-                                         /*row_group_row_count=*/150));
+        auto sel,
+        col_index->FilterPages(*PhysicalToScalar<TypeParam>(pred_val, col_descr.get()),
+                               PredicateOp::EQ, *off_index,
+                               /*row_group_row_count=*/150));
     ASSERT_EQ(3, sel.page_count());
     EXPECT_TRUE(sel.selector(0).skip);   // [false,false] does not contain true
     EXPECT_FALSE(sel.selector(1).skip);  // [true,true] contains true
@@ -1292,7 +1331,8 @@ TYPED_TEST(TestColumnIndexFilterPages, AllTypes) {
   ASSERT_NE(nullptr, off_index);
 
   PARQUET_ASSIGN_OR_THROW(
-      auto sel, col_index->FilterPages(std::any(mid), PredicateOp::EQ, *off_index,
+      auto sel, col_index->FilterPages(*PhysicalToScalar<TypeParam>(mid, col_descr.get()),
+                                       PredicateOp::EQ, *off_index,
                                        /*row_group_row_count=*/300));
 
   ASSERT_EQ(3, sel.page_count());
@@ -1355,8 +1395,10 @@ TYPED_TEST(TestColumnIndexFilterPages, AllNullPage) {
   // EQ predicate: all-null page must be skipped, non-null page selected
   // (since min==max==some_value matches EQ some_value).
   PARQUET_ASSIGN_OR_THROW(
-      auto sel, col_index->FilterPages(std::any(some_value), PredicateOp::EQ, *off_index,
-                                       /*row_group_row_count=*/200));
+      auto sel,
+      col_index->FilterPages(*PhysicalToScalar<TypeParam>(some_value, col_descr.get()),
+                             PredicateOp::EQ, *off_index,
+                             /*row_group_row_count=*/200));
 
   ASSERT_EQ(2, sel.page_count());
   EXPECT_TRUE(sel.selector(0).skip);   // all-null page → must skip
@@ -1364,8 +1406,9 @@ TYPED_TEST(TestColumnIndexFilterPages, AllNullPage) {
 
   // Also verify IS_NULL on the all-null page: must NOT skip.
   PARQUET_ASSIGN_OR_THROW(
-      auto sel_null, col_index->FilterPages(std::any{}, PredicateOp::IS_NULL, *off_index,
-                                            /*row_group_row_count=*/200));
+      auto sel_null,
+      col_index->FilterPages(::arrow::NullScalar(), PredicateOp::IS_NULL, *off_index,
+                             /*row_group_row_count=*/200));
 
   ASSERT_EQ(2, sel_null.page_count());
   EXPECT_FALSE(sel_null.selector(0).skip);  // all-null page → keep for IS_NULL
@@ -1427,8 +1470,9 @@ TYPED_TEST(TestColumnIndexFilterPages, RowCountsFromOffsetIndex) {
 
   // IS_NOT_NULL selects all pages; use it to get RowSelection with correct row counts.
   PARQUET_ASSIGN_OR_THROW(
-      auto sel, col_index->FilterPages(std::any{}, PredicateOp::IS_NOT_NULL, *off_index,
-                                       /*row_group_row_count=*/400));
+      auto sel,
+      col_index->FilterPages(::arrow::NullScalar(), PredicateOp::IS_NOT_NULL, *off_index,
+                             /*row_group_row_count=*/400));
 
   ASSERT_EQ(3, sel.page_count());
   EXPECT_EQ(100, sel.selector(0).row_count);  // 100 - 0 = 100
@@ -1508,8 +1552,10 @@ TYPED_TEST(TestColumnIndexFilterPages, PredicateOverlapsAll) {
   PredicateOp op =
       std::is_same_v<TypeParam, BooleanType> ? PredicateOp::IS_NOT_NULL : PredicateOp::EQ;
 
-  PARQUET_ASSIGN_OR_THROW(auto sel, col_index->FilterPages(std::any(pred), op, *off_index,
-                                                           /*row_group_row_count=*/200));
+  PARQUET_ASSIGN_OR_THROW(
+      auto sel, col_index->FilterPages(
+                    *PhysicalToScalar<TypeParam>(pred, col_descr.get()), op, *off_index,
+                    /*row_group_row_count=*/200));
 
   ASSERT_EQ(2, sel.page_count());
   EXPECT_FALSE(sel.selector(0).skip);  // pred in [lo,hi] → select
@@ -1550,8 +1596,10 @@ TYPED_TEST(TestColumnIndexFilterPages, PredicateOverlapsNone) {
 
     bool pred_val = true;
     PARQUET_ASSIGN_OR_THROW(
-        auto sel, col_index->FilterPages(std::any(pred_val), PredicateOp::EQ, *off_index,
-                                         /*row_group_row_count=*/200));
+        auto sel,
+        col_index->FilterPages(*PhysicalToScalar<TypeParam>(pred_val, col_descr.get()),
+                               PredicateOp::EQ, *off_index,
+                               /*row_group_row_count=*/200));
 
     ASSERT_EQ(2, sel.page_count());
     EXPECT_TRUE(sel.selector(0).skip);
@@ -1613,8 +1661,10 @@ TYPED_TEST(TestColumnIndexFilterPages, PredicateOverlapsNone) {
 
   // EQ pred_above: all pages have max <= hi < pred_above → all skipped.
   PARQUET_ASSIGN_OR_THROW(
-      auto sel, col_index->FilterPages(std::any(pred_above), PredicateOp::EQ, *off_index,
-                                       /*row_group_row_count=*/200));
+      auto sel,
+      col_index->FilterPages(*PhysicalToScalar<TypeParam>(pred_above, col_descr.get()),
+                             PredicateOp::EQ, *off_index,
+                             /*row_group_row_count=*/200));
 
   ASSERT_EQ(2, sel.page_count());
   EXPECT_TRUE(sel.selector(0).skip);
@@ -1680,7 +1730,8 @@ TYPED_TEST(TestColumnIndexFilterPages, SinglePageMatch) {
   // --- Match: EQ in_range against [in_range,in_range] → select.
   PARQUET_ASSIGN_OR_THROW(
       auto sel_match,
-      col_index->FilterPages(std::any(in_range), PredicateOp::EQ, *off_index,
+      col_index->FilterPages(*PhysicalToScalar<TypeParam>(in_range, col_descr.get()),
+                             PredicateOp::EQ, *off_index,
                              /*row_group_row_count=*/200));
 
   ASSERT_EQ(1, sel_match.page_count());
@@ -1690,7 +1741,8 @@ TYPED_TEST(TestColumnIndexFilterPages, SinglePageMatch) {
   // --- Non-match: EQ out_of_range against [in_range,in_range] → skip.
   PARQUET_ASSIGN_OR_THROW(
       auto sel_no_match,
-      col_index->FilterPages(std::any(out_of_range), PredicateOp::EQ, *off_index,
+      col_index->FilterPages(*PhysicalToScalar<TypeParam>(out_of_range, col_descr.get()),
+                             PredicateOp::EQ, *off_index,
                              /*row_group_row_count=*/200));
 
   ASSERT_EQ(1, sel_no_match.page_count());
@@ -1755,18 +1807,20 @@ TYPED_TEST(TestColumnIndexFilterPages, MinEqualsMax) {
   ASSERT_NE(nullptr, off_index);
 
   // EQ val_a: page 0 has exactly val_a → select; page 1 has val_b ≠ val_a → skip.
-  PARQUET_ASSIGN_OR_THROW(
-      auto sel, col_index->FilterPages(std::any(val_a), PredicateOp::EQ, *off_index,
-                                       /*row_group_row_count=*/200));
+  PARQUET_ASSIGN_OR_THROW(auto sel, col_index->FilterPages(*PhysicalToScalar<TypeParam>(
+                                                               val_a, col_descr.get()),
+                                                           PredicateOp::EQ, *off_index,
+                                                           /*row_group_row_count=*/200));
 
   ASSERT_EQ(2, sel.page_count());
   EXPECT_FALSE(sel.selector(0).skip);  // [val_a, val_a] contains val_a
   EXPECT_TRUE(sel.selector(1).skip);   // [val_b, val_b] does not contain val_a
 
   // EQ val_b: page 1 has exactly val_b → select; page 0 has val_a ≠ val_b → skip.
-  PARQUET_ASSIGN_OR_THROW(
-      auto sel2, col_index->FilterPages(std::any(val_b), PredicateOp::EQ, *off_index,
-                                        /*row_group_row_count=*/200));
+  PARQUET_ASSIGN_OR_THROW(auto sel2, col_index->FilterPages(*PhysicalToScalar<TypeParam>(
+                                                                val_b, col_descr.get()),
+                                                            PredicateOp::EQ, *off_index,
+                                                            /*row_group_row_count=*/200));
 
   ASSERT_EQ(2, sel2.page_count());
   EXPECT_TRUE(sel2.selector(0).skip);   // [val_a, val_a] does not contain val_b
@@ -1799,8 +1853,10 @@ TYPED_TEST(TestColumnIndexFilterPages, ZeroPages) {
 
   T dummy_val{};
   PARQUET_ASSIGN_OR_THROW(
-      auto sel, col_index->FilterPages(std::any(dummy_val), PredicateOp::EQ, *off_index,
-                                       /*row_group_row_count=*/0));
+      auto sel,
+      col_index->FilterPages(*PhysicalToScalar<TypeParam>(dummy_val, col_descr.get()),
+                             PredicateOp::EQ, *off_index,
+                             /*row_group_row_count=*/0));
 
   EXPECT_EQ(0, sel.page_count());
   EXPECT_EQ(0, sel.row_count());

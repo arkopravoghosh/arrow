@@ -420,12 +420,14 @@ match).
    auto result = file_reader->ComputePageSelection(
        /*column_index=*/ 0,
        /*op=*/           parquet::PredicateOp::GT,
-       /*predicate_value=*/ std::any(int32_t(50)));
+       /*predicate_value=*/ arrow::Int32Scalar(50));
 
    auto& selections = result.ValueOrDie();  // map<int, shared_ptr<RowSelection>>
 
 Supported operators (``parquet::PredicateOp``): ``GT``, ``LT``, ``EQ``,
-``GTE``, ``LTE``, ``IS_NULL``, ``IS_NOT_NULL``.
+``GTE``, ``LTE``, ``IS_NULL``, ``IS_NOT_NULL``.  The predicate value is an
+``arrow::Scalar``; its type must be convertible to the column's physical type
+(ignored for ``IS_NULL`` / ``IS_NOT_NULL``).
 
 Each call evaluates a single ``column op value`` predicate.  To push down a
 conjunction of predicates over several columns, call ``ComputePageSelection``

@@ -25,10 +25,13 @@
 #include "parquet/type_fwd.h"
 #include "parquet/types.h"
 
-#include <any>
 #include <optional>
 #include <string>
 #include <vector>
+
+namespace arrow {
+class Scalar;
+}  // namespace arrow
 
 namespace parquet {
 
@@ -105,8 +108,9 @@ class PARQUET_EXPORT ColumnIndex {
   ///
   /// Used by query engines for page-level pruning during scans.
   ///
-  /// \param predicate_value  The scalar value to compare against (type must
-  ///        match the column's physical type; unused for IS_NULL / IS_NOT_NULL).
+  /// \param predicate_value  The scalar value to compare against.  Its type must
+  ///        be convertible to the column's physical type (unused for
+  ///        IS_NULL / IS_NOT_NULL, where it may be null).
   /// \param op   The comparison operator to apply.
   /// \param offset_index  Provides per-page first_row_index values used to map
   ///        page selections to row ranges.
@@ -121,8 +125,8 @@ class PARQUET_EXPORT ColumnIndex {
   /// Non-pure with a NotImplemented default so that adding this method does not
   /// break the ABI of external ColumnIndex subclasses.
   virtual ::arrow::Result<RowSelection> FilterPages(
-      const std::any& predicate_value, PredicateOp op, const OffsetIndex& offset_index,
-      int64_t row_group_row_count) const {
+      const ::arrow::Scalar& predicate_value, PredicateOp op,
+      const OffsetIndex& offset_index, int64_t row_group_row_count) const {
     return ::arrow::Status::NotImplemented(
         "FilterPages is not implemented by this ColumnIndex");
   }

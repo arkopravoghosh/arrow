@@ -17,7 +17,6 @@
 
 #include "arrow/dataset/file_parquet.h"
 
-#include <any>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -35,6 +34,7 @@
 #include "arrow/dataset/parquet_encryption_config.h"
 #include "arrow/dataset/scanner.h"
 #include "arrow/filesystem/path_util.h"
+#include "arrow/scalar.h"
 #include "arrow/table.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/future.h"
@@ -1100,7 +1100,7 @@ namespace {
 struct LeafPredicate {
   int column_index;
   parquet::PredicateOp op;
-  std::any value;  // empty for is_null / is_not_null
+  std::shared_ptr<Scalar> value;  // null for is_null / is_not_null
 };
 
 /// Map Arrow compute function names to the PredicateOp accepted by
@@ -1114,132 +1114,6 @@ std::optional<parquet::PredicateOp> ArrowFunctionToPageOp(const std::string& fn)
   if (fn == "is_null") return parquet::PredicateOp::IS_NULL;
   if (fn == "is_valid") return parquet::PredicateOp::IS_NOT_NULL;
   return std::nullopt;
-}
-
-/// Attempt to extract a scalar value from an Arrow Scalar as a std::any whose
-/// C++ type matches the *Parquet physical type* of @p target_col.  This is
-/// required because ComputePageSelection performs a typeid() check on the
-/// std::any value, so storing INT8/INT16/INT32 values as int64_t would cause a
-/// type mismatch for any column whose Parquet physical type is INT32.
-///
-/// Returns an error Status for combinations that cannot be represented, or
-/// Status::NotImplemented for unsupported Arrow types.
-arrow::Result<std::any> ScalarToAny(const Scalar& scalar,
-                                    const parquet::ColumnDescriptor* target_col) {
-  if (!scalar.is_valid) return std::any{};
-
-  const parquet::Type::type parquet_phys = target_col->physical_type();
-
-  switch (scalar.type->id()) {
-    case Type::BOOL:
-      if (parquet_phys != parquet::Type::BOOLEAN) {
-        return Status::TypeError("Cannot compare BOOL scalar to Parquet column of type ",
-                                 parquet::TypeToString(parquet_phys));
-      }
-      return std::any{checked_cast<const BooleanScalar&>(scalar).value};
-
-    case Type::INT8:
-    case Type::INT16:
-    case Type::INT32: {
-      // Arrow INT8/INT16/INT32 scalars all carry an int32_t-range value; select
-      // the C++ type to match the Parquet physical type so typeid() succeeds.
-      int32_t v32;
-      if (scalar.type->id() == Type::INT8)
-        v32 = static_cast<int32_t>(checked_cast<const Int8Scalar&>(scalar).value);
-      else if (scalar.type->id() == Type::INT16)
-        v32 = static_cast<int32_t>(checked_cast<const Int16Scalar&>(scalar).value);
-      else
-        v32 = checked_cast<const Int32Scalar&>(scalar).value;
-
-      if (parquet_phys == parquet::Type::INT32) return std::any{v32};
-      if (parquet_phys == parquet::Type::INT64)
-        return std::any{static_cast<int64_t>(v32)};
-      return Status::TypeError(
-          "Cannot compare INT8/INT16/INT32 scalar to Parquet column of type ",
-          parquet::TypeToString(parquet_phys));
-    }
-
-    case Type::INT64:
-      if (parquet_phys != parquet::Type::INT64) {
-        return Status::TypeError("Cannot compare INT64 scalar to Parquet column of type ",
-                                 parquet::TypeToString(parquet_phys));
-      }
-      return std::any{checked_cast<const Int64Scalar&>(scalar).value};
-
-    case Type::UINT8:
-    case Type::UINT16: {
-      // Small unsigned integers fit in INT32 physical columns.
-      uint32_t v32;
-      if (scalar.type->id() == Type::UINT8)
-        v32 = static_cast<uint32_t>(checked_cast<const UInt8Scalar&>(scalar).value);
-      else
-        v32 = static_cast<uint32_t>(checked_cast<const UInt16Scalar&>(scalar).value);
-
-      if (parquet_phys == parquet::Type::INT32)
-        return std::any{static_cast<int32_t>(v32)};
-      if (parquet_phys == parquet::Type::INT64)
-        return std::any{static_cast<int64_t>(v32)};
-      return Status::TypeError(
-          "Cannot compare UINT8/UINT16 scalar to Parquet column of type ",
-          parquet::TypeToString(parquet_phys));
-    }
-
-    case Type::UINT32: {
-      uint32_t v = checked_cast<const UInt32Scalar&>(scalar).value;
-      // INT32 physical columns store signed values; promote to INT64 when the
-      // value exceeds INT32_MAX to avoid silent truncation.
-      if (parquet_phys == parquet::Type::INT32) {
-        if (v > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
-          return Status::TypeError(
-              "UINT32 value ", v,
-              " exceeds INT32_MAX; cannot fit in INT32 physical column");
-        }
-        return std::any{static_cast<int32_t>(v)};
-      }
-      if (parquet_phys == parquet::Type::INT64) return std::any{static_cast<int64_t>(v)};
-      return Status::TypeError("Cannot compare UINT32 scalar to Parquet column of type ",
-                               parquet::TypeToString(parquet_phys));
-    }
-
-    case Type::UINT64: {
-      uint64_t v = checked_cast<const UInt64Scalar&>(scalar).value;
-      if (parquet_phys == parquet::Type::INT64) return std::any{static_cast<int64_t>(v)};
-      return Status::TypeError("Cannot compare UINT64 scalar to Parquet column of type ",
-                               parquet::TypeToString(parquet_phys));
-    }
-
-    case Type::FLOAT:
-      if (parquet_phys != parquet::Type::FLOAT) {
-        return Status::TypeError("Cannot compare FLOAT scalar to Parquet column of type ",
-                                 parquet::TypeToString(parquet_phys));
-      }
-      return std::any{checked_cast<const FloatScalar&>(scalar).value};
-
-    case Type::DOUBLE:
-      if (parquet_phys != parquet::Type::DOUBLE) {
-        return Status::TypeError(
-            "Cannot compare DOUBLE scalar to Parquet column of type ",
-            parquet::TypeToString(parquet_phys));
-      }
-      return std::any{checked_cast<const DoubleScalar&>(scalar).value};
-
-    case Type::STRING:
-    case Type::LARGE_STRING:
-      if (parquet_phys != parquet::Type::BYTE_ARRAY) {
-        return Status::TypeError(
-            "Cannot compare STRING scalar to Parquet column of type ",
-            parquet::TypeToString(parquet_phys));
-      }
-      if (scalar.type->id() == Type::STRING)
-        return std::any{
-            std::string(checked_cast<const StringScalar&>(scalar).value->ToString())};
-      return std::any{
-          std::string(checked_cast<const LargeStringScalar&>(scalar).value->ToString())};
-
-    default:
-      return Status::NotImplemented("ScalarToAny: unsupported Arrow type ",
-                                    scalar.type->ToString());
-  }
 }
 
 /// Walk a compute::Expression tree (depth-first, AND-conjunction aware) and
@@ -1269,9 +1143,10 @@ arrow::Result<std::any> ScalarToAny(const Scalar& scalar,
 /// which is safe: page pruning is an optimization, and the exact predicate is
 /// always re-applied by the scanner after reading.
 ///
-/// @p parquet_schema is used to look up each column's Parquet physical type so
-/// that ScalarToAny() can produce a std::any value whose C++ type matches what
-/// ComputePageSelection() expects.
+/// @p parquet_schema is used to validate each leaf's column index against the
+/// Parquet file schema.  The extracted Arrow Scalar is passed through to
+/// ComputePageSelection(), which resolves the column's physical type and
+/// converts the scalar accordingly.
 void ExtractLeafPredicates(const compute::Expression& expr,
                            const SchemaManifest& manifest, const Schema& physical_schema,
                            const parquet::SchemaDescriptor& parquet_schema,
@@ -1342,27 +1217,16 @@ void ExtractLeafPredicates(const compute::Expression& expr,
   const Datum* datum = literal_expr->literal();
   if (!datum || !datum->is_scalar()) return;
 
-  // Look up the Parquet physical type for this column so that ScalarToAny can
-  // produce a std::any value whose C++ type matches ComputePageSelection's
-  // typeid() check.
   int col_idx = schema_field->column_index;
   if (col_idx < 0 || col_idx >= parquet_schema.num_columns()) return;
-  const parquet::ColumnDescriptor* col_desc = parquet_schema.Column(col_idx);
-  if (!col_desc) return;
 
-  auto any_value_result = ScalarToAny(*datum->scalar(), col_desc);
-  if (!any_value_result.ok()) {
-    // The scalar type is incompatible with the Parquet physical type (e.g.
-    // string vs INT32).  Skip this predicate rather than silently corrupting
-    // page pruning.
-    ARROW_LOG(WARNING) << "ScalarToAny failed for column " << col_idx << ": "
-                       << any_value_result.status().message();
-    return;
-  }
-  std::any val = std::move(any_value_result).ValueUnsafe();
-  if (!val.has_value()) return;
+  // Store the Arrow Scalar directly. ColumnIndex::FilterPages() resolves the
+  // column's physical type and converts the scalar accordingly, rejecting
+  // incompatible types (e.g. STRING vs INT32) at evaluation time.
+  auto scalar = datum->scalar();
+  if (!scalar || !scalar->is_valid) return;
 
-  out->push_back({col_idx, op, std::move(val)});
+  out->push_back({col_idx, op, std::move(scalar)});
 }
 
 }  // namespace
@@ -1402,8 +1266,7 @@ Status ParquetFileFragment::ComputePageSelections(const compute::Expression& pre
   }
 
   // Extract individual leaf predicates from the (possibly compound) filter.
-  // Pass the Parquet file schema so ScalarToAny() can match the physical type
-  // of each column and produce a std::any with the correct C++ type.
+  // Pass the Parquet file schema to validate each leaf's column index.
   const parquet::SchemaDescriptor* parquet_schema = parquet_reader->metadata()->schema();
   DCHECK_NE(parquet_schema, nullptr);
   std::vector<LeafPredicate> leaf_predicates;
@@ -1425,20 +1288,25 @@ Status ParquetFileFragment::ComputePageSelections(const compute::Expression& pre
   for (const auto& leaf : leaf_predicates) {
     std::map<int, std::shared_ptr<parquet::RowSelection>> per_col;
 
+    // IS_NULL / IS_NOT_NULL carry no value; pass a placeholder scalar that
+    // FilterPages ignores for those operators.
+    static const ::arrow::NullScalar kNullPlaceholder;
+    const ::arrow::Scalar& value =
+        leaf.value ? static_cast<const ::arrow::Scalar&>(*leaf.value)
+                   : static_cast<const ::arrow::Scalar&>(kNullPlaceholder);
+
     if (policy == parquet::PageIndexPolicy::ALWAYS) {
       // ALWAYS: propagate errors back to the caller.
       ARROW_ASSIGN_OR_RAISE(per_col, parquet_reader->ComputePageSelection(
-                                         leaf.column_index, leaf.op, leaf.value,
+                                         leaf.column_index, leaf.op, value,
                                          row_groups_ ? &(*row_groups_) : nullptr));
     } else {
       // AUTO: swallow errors (e.g. absent page index) and fall back.
-      auto result =
-          parquet_reader->ComputePageSelection(leaf.column_index, leaf.op, leaf.value,
-                                               row_groups_ ? &(*row_groups_) : nullptr);
+      auto result = parquet_reader->ComputePageSelection(
+          leaf.column_index, leaf.op, value, row_groups_ ? &(*row_groups_) : nullptr);
       if (!result.ok()) {
         ARROW_LOG(WARNING) << "ComputePageSelection failed for column "
-                           << leaf.column_index << " (op="
-                           << static_cast<int>(leaf.op)
+                           << leaf.column_index << " (op=" << static_cast<int>(leaf.op)
                            << "); falling back to row-group pruning: "
                            << result.status().message();
         continue;

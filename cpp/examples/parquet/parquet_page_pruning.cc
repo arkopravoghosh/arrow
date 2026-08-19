@@ -32,7 +32,6 @@
 //
 // If no file path is given, a temporary file is generated and then read back.
 
-#include <any>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -41,6 +40,7 @@
 
 #include "arrow/api.h"
 #include "arrow/io/api.h"
+#include "arrow/scalar.h"
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/writer.h"
 #include "parquet/file_reader.h"
@@ -115,7 +115,7 @@ static int64_t ReadWithPruning(const std::string& path) {
   // ColumnIndex and returns a RowSelection per row group.
   auto selection_result = file_reader->ComputePageSelection(
       /*column_index=*/0, /*op=*/parquet::PredicateOp::GT,
-      /*predicate_value=*/std::any(int32_t(50)));
+      /*predicate_value=*/arrow::Int32Scalar(50));
   PARQUET_THROW_NOT_OK(selection_result.status());
   auto selections = selection_result.ValueOrDie();
 

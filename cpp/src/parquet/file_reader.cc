@@ -18,7 +18,6 @@
 #include "parquet/file_reader.h"
 
 #include <algorithm>
-#include <any>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -1028,7 +1027,7 @@ const ArrowReaderProperties& ParquetFileReader::arrow_reader_properties() const 
 
 ::arrow::Result<std::map<int, std::shared_ptr<RowSelection>>>
 ParquetFileReader::ComputePageSelection(int column_index, PredicateOp op,
-                                        const std::any& predicate_value,
+                                        const ::arrow::Scalar& predicate_value,
                                         const std::vector<int>* row_group_indices) const {
   // Validate column_index.
   const int num_columns = metadata()->num_columns();

@@ -73,7 +73,7 @@ struct PARQUET_EXPORT RowSelector {
 ///   // ParquetFileReader::GetRecordReader() to restrict I/O to matching pages.
 ///   ARROW_ASSIGN_OR_RAISE(auto selections,
 ///                         reader->ComputePageSelection(col_idx, PredicateOp::GT,
-///                                                      std::any(int32_t(50))));
+///                                                      arrow::Int32Scalar(50)));
 ///   const auto& row_sel = selections[rg_idx];
 /// \endcode
 class PARQUET_EXPORT RowSelection {

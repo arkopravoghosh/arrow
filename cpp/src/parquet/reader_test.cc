@@ -40,6 +40,7 @@
 #include "arrow/buffer.h"
 #include "arrow/io/file.h"
 #include "arrow/io/memory.h"
+#include "arrow/scalar.h"
 #include "arrow/testing/future_util.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/random.h"
@@ -2321,7 +2322,8 @@ TEST_F(TestParquetFileReaderPagePruning, ComputePageSelectionOneRG) {
   reader->set_arrow_reader_properties(arrow_props);
 
   // Predicate: value > 50 — matches only RG 1 (values 51–100).
-  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{50}));
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(
+                                         0, PredicateOp::GT, ::arrow::Int32Scalar(50)));
 
   ASSERT_EQ(2, static_cast<int>(sel_map.size()));
 
@@ -2355,8 +2357,8 @@ TEST_F(TestParquetFileReaderPagePruning, GetRecordReaderWithSelection) {
   reader->set_arrow_reader_properties(arrow_props);
 
   // Predicate: value >= 80 — RG 1 holds values 51–100.
-  ASSERT_OK_AND_ASSIGN(auto sel_map,
-                       reader->ComputePageSelection(0, PredicateOp::GTE, int32_t{80}));
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(
+                                         0, PredicateOp::GTE, ::arrow::Int32Scalar(80)));
 
   // The page's [min,max]=[51,100] overlaps the predicate, so it is selected; the
   // selection covers all 50 rows of the (single-page) row group.
@@ -2387,7 +2389,8 @@ TEST_F(TestParquetFileReaderPagePruning, NeverPolicyReturnsAll) {
   reader->set_arrow_reader_properties(arrow_props);
 
   // With NEVER policy, ComputePageSelection must return select-all regardless.
-  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{50}));
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(
+                                         0, PredicateOp::GT, ::arrow::Int32Scalar(50)));
 
   ASSERT_EQ(2, static_cast<int>(sel_map.size()));
   for (const auto& [rg_idx, sel] : sel_map) {
@@ -2409,7 +2412,8 @@ TEST_F(TestParquetFileReaderPagePruning, AlwaysPolicyPrunes) {
   reader->set_arrow_reader_properties(arrow_props);
 
   // Predicate: value > 50. File has page index, so ALWAYS should work.
-  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{50}));
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(
+                                         0, PredicateOp::GT, ::arrow::Int32Scalar(50)));
 
   ASSERT_EQ(2, static_cast<int>(sel_map.size()));
 
@@ -2435,7 +2439,8 @@ TEST_F(TestParquetFileReaderPagePruning, MissingIndexFallback) {
   reader->set_arrow_reader_properties(arrow_props);
 
   // Should succeed and return select-all (no error, no crash).
-  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{3}));
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(
+                                         0, PredicateOp::GT, ::arrow::Int32Scalar(3)));
 
   ASSERT_EQ(1, static_cast<int>(sel_map.size()));
   // Select-all: every row must be selected.
@@ -2455,7 +2460,8 @@ TEST_F(TestParquetFileReaderPagePruning, EmptyRowGroup) {
   arrow_props.set_page_index_policy(PageIndexPolicy::AUTO);
   reader->set_arrow_reader_properties(arrow_props);
 
-  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{0}));
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(
+                                         0, PredicateOp::GT, ::arrow::Int32Scalar(0)));
 
   ASSERT_EQ(1, static_cast<int>(sel_map.size()));
   const auto& sel = *sel_map.at(0);
@@ -2476,7 +2482,8 @@ TEST_F(TestParquetFileReaderPagePruning, AllNullColumn) {
   reader->set_arrow_reader_properties(arrow_props);
 
   // "gt 0" can never match a null value, so we expect the whole RG to be skipped.
-  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(0, PredicateOp::GT, int32_t{0}));
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(
+                                         0, PredicateOp::GT, ::arrow::Int32Scalar(0)));
 
   ASSERT_EQ(1, static_cast<int>(sel_map.size()));
   const auto& sel = *sel_map.at(0);
@@ -2515,9 +2522,9 @@ TEST_F(TestParquetFileReaderPagePruning, EmptyColumnList) {
   reader->set_arrow_reader_properties(arrow_props);
 
   // Pass nullptr for row_group_indices — should process all row groups.
-  ASSERT_OK_AND_ASSIGN(
-      auto sel_map,
-      reader->ComputePageSelection(0, PredicateOp::GT, int32_t{0}, /*row_group_indices=*/nullptr));
+  ASSERT_OK_AND_ASSIGN(auto sel_map, reader->ComputePageSelection(
+                                         0, PredicateOp::GT, ::arrow::Int32Scalar(0),
+                                         /*row_group_indices=*/nullptr));
 
   // All 2 row groups must appear in the result map.
   int num_rgs = reader->metadata()->num_row_groups();
